@@ -1,4 +1,4 @@
-module github.com/tenet-voice/go-sdk
+module github.com/tenet-voice/tenet-go
 
 go 1.25.0
 

@@ -1,3 +1,19 @@
+// Package tenet routes OpenAI-compatible HTTP requests through the Tenet
+// inference proxy for production observability, A/B model routing, and
+// automatic failover.
+//
+// Usage is a single-line change to any [github.com/openai/openai-go] client:
+//
+//	client := openai.NewClient(
+//		option.WithAPIKey(os.Getenv("OPENAI_API_KEY")),
+//		option.WithHTTPClient(tenet.WrapHTTPClient(http.DefaultClient, tenet.Config{
+//			TenetKey: os.Getenv("TENET_API_KEY"),
+//		})),
+//	)
+//
+// All requests — including streaming — are transparently proxied. If the proxy
+// is unreachable or returns a 5xx, the SDK falls back to calling the provider
+// directly so your agent never goes silent.
 package tenet
 
 import (
@@ -14,10 +30,20 @@ const defaultProxyURL = "https://inference.trytenet.ai"
 
 // Config holds settings for the Tenet proxy transport.
 type Config struct {
+	// TenetKey authenticates requests to the Tenet proxy.
 	TenetKey string
+
+	// ProxyURL overrides the default proxy endpoint (https://inference.trytenet.ai).
+	// Use this for self-hosted or staging deployments.
 	ProxyURL string
+
+	// Failover controls whether the SDK falls back to calling the provider
+	// directly when the proxy is unreachable or returns a 5xx. Default is false;
+	// set to true for production resilience.
 	Failover bool
-	Timeout  time.Duration
+
+	// Timeout sets the HTTP client timeout. Zero means no timeout.
+	Timeout time.Duration
 }
 
 type tenetTransport struct {
@@ -28,9 +54,12 @@ type tenetTransport struct {
 	callerID atomic.Value
 }
 
-// WrapHTTPClient returns a new *http.Client whose transport routes requests
-// through the Tenet inference proxy, injecting auth headers and supporting
-// optional failover to the original endpoint on 5xx responses.
+// WrapHTTPClient returns a new [http.Client] whose transport routes requests
+// through the Tenet inference proxy. The original client's transport is
+// preserved and used for the underlying HTTP calls (and for failover).
+//
+// Pass the returned client to [github.com/openai/openai-go/option.WithHTTPClient]
+// or use it directly — any OpenAI-compatible HTTP request is supported.
 func WrapHTTPClient(client *http.Client, config Config) *http.Client {
 	proxyURL := config.ProxyURL
 	if proxyURL == "" {
@@ -55,15 +84,17 @@ func WrapHTTPClient(client *http.Client, config Config) *http.Client {
 	}
 }
 
-// SetCallerID stores a caller ID on the wrapped client for sticky A/B routing.
-// Safe to call from multiple goroutines.
+// SetCallerID attaches a caller identifier to the wrapped client for sticky
+// A/B routing. The proxy uses this to ensure the same caller always hits the
+// same model variant (via FNV-1a hash). Safe for concurrent use.
 func SetCallerID(client *http.Client, id string) {
 	if t, ok := client.Transport.(*tenetTransport); ok {
 		t.callerID.Store(id)
 	}
 }
 
-// ClearCallerID removes the caller ID so requests use per-request weighted routing.
+// ClearCallerID removes the caller identifier so subsequent requests use
+// per-request weighted-random routing instead of sticky assignment.
 func ClearCallerID(client *http.Client) {
 	if t, ok := client.Transport.(*tenetTransport); ok {
 		t.callerID.Store("")
@@ -73,7 +104,6 @@ func ClearCallerID(client *http.Client) {
 func (t *tenetTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	originalURL := req.URL.String()
 
-	// Buffer the body so it can be replayed on failover.
 	var bodyBytes []byte
 	if req.Body != nil && req.Body != http.NoBody {
 		var err error
