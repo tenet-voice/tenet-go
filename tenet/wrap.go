@@ -44,6 +44,10 @@ type Config struct {
 
 	// Timeout sets the HTTP client timeout. Zero means no timeout.
 	Timeout time.Duration
+
+	// OnAttribution, if set, is called once per request with how the proxy
+	// served it. On client-side failover it is called with ServedDirect:true.
+	OnAttribution func(Attribution)
 }
 
 // Attribution describes how the proxy served a request, parsed from the
@@ -67,11 +71,12 @@ func parseAttribution(h http.Header) Attribution {
 }
 
 type tenetTransport struct {
-	inner    http.RoundTripper
-	tenetKey string
-	proxyURL string
-	failover bool
-	callerID atomic.Value
+	inner         http.RoundTripper
+	tenetKey      string
+	proxyURL      string
+	failover      bool
+	callerID      atomic.Value
+	onAttribution func(Attribution)
 }
 
 // WrapHTTPClient returns a new [http.Client] whose transport routes requests
@@ -92,10 +97,11 @@ func WrapHTTPClient(client *http.Client, config Config) *http.Client {
 	}
 
 	t := &tenetTransport{
-		inner:    inner,
-		tenetKey: config.TenetKey,
-		proxyURL: proxyURL,
-		failover: config.Failover,
+		inner:         inner,
+		tenetKey:      config.TenetKey,
+		proxyURL:      proxyURL,
+		failover:      config.Failover,
+		onAttribution: config.OnAttribution,
 	}
 
 	return &http.Client{
@@ -155,6 +161,7 @@ func (t *tenetTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if err != nil {
 		if t.failover {
 			t.reportTelemetry(err.Error())
+			t.emitAttribution(Attribution{ServedDirect: true})
 			fallbackReq := req.Clone(req.Context())
 			if len(bodyBytes) > 0 {
 				fallbackReq.Body = io.NopCloser(bytes.NewReader(bodyBytes))
@@ -168,6 +175,7 @@ func (t *tenetTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if resp.StatusCode >= 500 && t.failover {
 		resp.Body.Close()
 		t.reportTelemetry("proxy returned " + resp.Status)
+		t.emitAttribution(Attribution{ServedDirect: true})
 		fallbackReq := req.Clone(req.Context())
 		if len(bodyBytes) > 0 {
 			fallbackReq.Body = io.NopCloser(bytes.NewReader(bodyBytes))
@@ -176,7 +184,14 @@ func (t *tenetTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return t.inner.RoundTrip(fallbackReq)
 	}
 
+	t.emitAttribution(parseAttribution(resp.Header))
 	return resp, nil
+}
+
+func (t *tenetTransport) emitAttribution(a Attribution) {
+	if t.onAttribution != nil {
+		t.onAttribution(a)
+	}
 }
 
 func (t *tenetTransport) reportTelemetry(errMsg string) {
