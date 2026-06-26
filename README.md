@@ -63,6 +63,35 @@ Request → Tenet Proxy → Provider
 
 Failover events are reported asynchronously to `POST /v1/telemetry` for monitoring.
 
+## Attribution
+
+Set `OnAttribution` to learn how each request was served — without coupling your code to Tenet's response-header names. The callback fires once per request:
+
+```go
+client := tenet.WrapHTTPClient(http.DefaultClient, tenet.Config{
+	TenetKey: os.Getenv("TENET_API_KEY"),
+	Failover: true,
+	OnAttribution: func(a tenet.Attribution) {
+		// a.Mode:           "passthrough" | "replacement" | "managed"
+		// a.ServedVariant:  which variant served the request
+		// a.MatchedProfile: which model profile matched (empty if none)
+		// a.FallbackUsed:   the proxy fell through to a backup variant
+		// a.ServedDirect:   the SDK bypassed Tenet (client-side failover)
+		log.Printf("served by %s (%s)", a.ServedVariant, a.Mode)
+	},
+})
+```
+
+The proxy reports `Mode`, `ServedVariant`, `MatchedProfile`, and `FallbackUsed` via `X-Tenet-*` response headers; the SDK parses them for you. On **client-side failover** (proxy unreachable or 5xx with `Failover: true`), the SDK didn't reach Tenet at all, so it reports `Attribution{ServedDirect: true}` with the other fields empty.
+
+For **streaming**, the callback fires when the response headers arrive (stream start), before the first token.
+
+Notes:
+
+- The callback runs **synchronously inside the request**. If you share one client across goroutines, make your callback concurrency-safe.
+- The callback carries no request context — scope **one wrapped client per caller** (each with its own closure) when you need to correlate attribution back to a specific call.
+- A `4xx`, or a `5xx` without failover, reaches the callback with whatever headers are present — usually an empty `Mode`. Treat empty `Mode` as "unknown / proxy error," not a served mode.
+
 ## Streaming
 
 Streaming works transparently. The proxy forwards SSE chunks as they arrive from the upstream provider — no buffering, no re-encoding:
@@ -88,6 +117,7 @@ for stream.Next() {
 | `ProxyURL` | `string` | `https://inference.trytenet.ai` | Proxy endpoint (override for self-hosted or staging) |
 | `Failover` | `bool` | `false` | Fall back to direct provider on proxy failure |
 | `Timeout` | `time.Duration` | `0` (no timeout) | HTTP client timeout |
+| `OnAttribution` | `func(Attribution)` | `nil` | Called once per request with how the proxy served it |
 
 ## How it works
 
@@ -99,6 +129,7 @@ for stream.Next() {
 4. Optionally injects `X-Caller-ID` for sticky routing
 5. Sends the request through the proxy
 6. On 5xx or network error (with failover enabled), replays to the original URL
+7. Parses the proxy's `X-Tenet-*` response headers into an `Attribution` and invokes `OnAttribution` (if set)
 
 Your provider credentials (`Authorization` header) pass through untouched.
 
