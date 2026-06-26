@@ -46,6 +46,26 @@ type Config struct {
 	Timeout time.Duration
 }
 
+// Attribution describes how the proxy served a request, parsed from the
+// X-Tenet-* response headers. ServedDirect is set by the SDK (not a header)
+// when it failed over to the provider directly, bypassing Tenet.
+type Attribution struct {
+	Mode           string // "passthrough" | "replacement" | "managed"
+	ServedVariant  string
+	MatchedProfile string
+	FallbackUsed   bool
+	ServedDirect   bool
+}
+
+func parseAttribution(h http.Header) Attribution {
+	return Attribution{
+		Mode:           h.Get("X-Tenet-Mode"),
+		ServedVariant:  h.Get("X-Tenet-Served-Variant"),
+		MatchedProfile: h.Get("X-Tenet-Matched-Profile"),
+		FallbackUsed:   h.Get("X-Tenet-Fallback-Used") == "true",
+	}
+}
+
 type tenetTransport struct {
 	inner    http.RoundTripper
 	tenetKey string
