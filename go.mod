@@ -1,6 +1,6 @@
 module github.com/tenet-voice/tenet-go
 
-go 1.25.0
+go 1.23.0
 
 require github.com/openai/openai-go v1.12.0
 
