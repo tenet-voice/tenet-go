@@ -101,10 +101,10 @@ func TestInjectsProviderURL(t *testing.T) {
 	}
 }
 
-func TestInjectsCallerID(t *testing.T) {
+func TestInjectsSessionID(t *testing.T) {
 	var gotHeader string
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotHeader = r.Header.Get("X-Caller-ID")
+		gotHeader = r.Header.Get("X-Tenet-Session-Id")
 		w.Write([]byte(`{"choices":[]}`))
 	}))
 	defer proxy.Close()
@@ -113,7 +113,7 @@ func TestInjectsCallerID(t *testing.T) {
 		TenetKey: "tk_xxx",
 		ProxyURL: proxy.URL,
 	})
-	SetCallerID(client, "caller_123")
+	SetSessionID(client, "caller_123")
 
 	req, _ := http.NewRequest("POST", "https://api.openai.com/v1/chat/completions",
 		strings.NewReader(`{}`))
@@ -125,10 +125,34 @@ func TestInjectsCallerID(t *testing.T) {
 	}
 }
 
-func TestNoCallerIDWhenUnset(t *testing.T) {
+func TestInjectsSessionTags(t *testing.T) {
+	var gotHeader string
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeader = r.Header.Get("X-Tenet-Session-Tags")
+		w.Write([]byte(`{"choices":[]}`))
+	}))
+	defer proxy.Close()
+
+	client := WrapHTTPClient(http.DefaultClient, Config{
+		TenetKey: "tk_xxx",
+		ProxyURL: proxy.URL,
+	})
+	SetSessionTags(client, []string{"beta", "internal"})
+
+	req, _ := http.NewRequest("POST", "https://api.openai.com/v1/chat/completions",
+		strings.NewReader(`{}`))
+	req.Header.Set("Authorization", "Bearer sk_xxx")
+	client.Do(req)
+
+	if gotHeader != "beta,internal" {
+		t.Errorf("expected beta,internal, got %s", gotHeader)
+	}
+}
+
+func TestNoSessionIDWhenUnset(t *testing.T) {
 	var hasHeader bool
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, hasHeader = r.Header["X-Caller-Id"]
+		_, hasHeader = r.Header["X-Tenet-Session-Id"]
 		w.Write([]byte(`{"choices":[]}`))
 	}))
 	defer proxy.Close()
@@ -144,7 +168,7 @@ func TestNoCallerIDWhenUnset(t *testing.T) {
 	client.Do(req)
 
 	if hasHeader {
-		t.Error("expected no X-Caller-ID header")
+		t.Error("expected no X-Tenet-Session-Id header")
 	}
 }
 
