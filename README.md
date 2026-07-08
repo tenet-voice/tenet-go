@@ -37,17 +37,27 @@ That's it. All requests — including streaming — are transparently proxied th
 
 ## A/B routing
 
-Tenet supports per-caller sticky model routing for A/B tests. Attach a caller ID and the proxy consistently routes that caller to the same model variant:
+Tenet supports per-session sticky model routing for A/B tests. Attach a session ID and the proxy consistently routes that session to the same model variant:
 
 ```go
-// Sticky routing — same caller always hits the same variant
-tenet.SetCallerID(httpClient, "caller_123")
+// Sticky routing — same session always hits the same variant
+tenet.SetSessionID(httpClient, "caller_123")
 
 // Back to weighted-random
-tenet.ClearCallerID(httpClient)
+tenet.ClearSessionID(httpClient)
 ```
 
-Caller IDs are hashed (FNV-1a) against configured variant weights. Without a caller ID, each request is independently routed by weight.
+Session IDs are hashed (FNV-1a) against configured variant weights. Without a session ID, each request is independently routed by weight.
+
+You can also attach cohort tags to a session (e.g. for cohort-based analysis or routing):
+
+```go
+tenet.SetSessionTags(httpClient, []string{"beta", "internal"})
+
+tenet.ClearSessionTags(httpClient)
+```
+
+Both `SessionID` and `SessionTags` can also be set at construction time via `Config`.
 
 ## Failover
 
@@ -114,6 +124,8 @@ for stream.Next() {
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `TenetKey` | `string` | required | API key for the Tenet proxy |
+| `SessionID` | `string` | `""` | Session identifier for sticky A/B routing |
+| `SessionTags` | `[]string` | `nil` | Cohort tags attached to the session |
 | `ProxyURL` | `string` | `https://inference.trytenet.ai` | Proxy endpoint (override for self-hosted or staging) |
 | `Failover` | `bool` | `false` | Fall back to direct provider on proxy failure |
 | `Timeout` | `time.Duration` | `0` (no timeout) | HTTP client timeout |
@@ -126,7 +138,7 @@ for stream.Next() {
 1. Buffers the request body (for potential failover replay)
 2. Rewrites the URL to point at the Tenet proxy
 3. Injects `X-Tenet-Key` (auth) and `X-Provider-URL` (original destination)
-4. Optionally injects `X-Caller-ID` for sticky routing
+4. Optionally injects `X-Tenet-Session-Id` and `X-Tenet-Session-Tags` for sticky routing
 5. Sends the request through the proxy
 6. On 5xx or network error (with failover enabled), replays to the original URL
 7. Parses the proxy's `X-Tenet-*` response headers into an `Attribution` and invokes `OnAttribution` (if set)

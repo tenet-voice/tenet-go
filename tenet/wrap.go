@@ -7,7 +7,9 @@
 //	client := openai.NewClient(
 //		option.WithAPIKey(os.Getenv("OPENAI_API_KEY")),
 //		option.WithHTTPClient(tenet.WrapHTTPClient(http.DefaultClient, tenet.Config{
-//			TenetKey: os.Getenv("TENET_API_KEY"),
+//			TenetKey:    os.Getenv("TENET_API_KEY"),
+//			SessionID:   "caller_123",
+//			SessionTags: []string{"beta", "internal"},
 //		})),
 //	)
 //
@@ -22,6 +24,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -32,6 +35,15 @@ const defaultProxyURL = "https://inference.trytenet.ai"
 type Config struct {
 	// TenetKey authenticates requests to the Tenet proxy.
 	TenetKey string
+
+	// SessionID identifies the caller/session for sticky A/B routing. The
+	// proxy uses this to ensure the same session always hits the same model
+	// variant (via FNV-1a hash).
+	SessionID string
+
+	// SessionTags attaches cohort tags to the session (e.g. for cohort-based
+	// routing or analysis).
+	SessionTags []string
 
 	// ProxyURL overrides the default proxy endpoint (https://inference.trytenet.ai).
 	// Use this for self-hosted or staging deployments.
@@ -75,7 +87,8 @@ type tenetTransport struct {
 	tenetKey      string
 	proxyURL      string
 	failover      bool
-	callerID      atomic.Value
+	sessionID     atomic.Value
+	sessionTags   atomic.Value
 	onAttribution func(Attribution)
 }
 
@@ -103,6 +116,8 @@ func WrapHTTPClient(client *http.Client, config Config) *http.Client {
 		failover:      config.Failover,
 		onAttribution: config.OnAttribution,
 	}
+	t.sessionID.Store(config.SessionID)
+	t.sessionTags.Store(config.SessionTags)
 
 	return &http.Client{
 		Transport: t,
@@ -110,20 +125,35 @@ func WrapHTTPClient(client *http.Client, config Config) *http.Client {
 	}
 }
 
-// SetCallerID attaches a caller identifier to the wrapped client for sticky
-// A/B routing. The proxy uses this to ensure the same caller always hits the
+// SetSessionID attaches a session identifier to the wrapped client for sticky
+// A/B routing. The proxy uses this to ensure the same session always hits the
 // same model variant (via FNV-1a hash). Safe for concurrent use.
-func SetCallerID(client *http.Client, id string) {
+func SetSessionID(client *http.Client, id string) {
 	if t, ok := client.Transport.(*tenetTransport); ok {
-		t.callerID.Store(id)
+		t.sessionID.Store(id)
 	}
 }
 
-// ClearCallerID removes the caller identifier so subsequent requests use
+// ClearSessionID removes the session identifier so subsequent requests use
 // per-request weighted-random routing instead of sticky assignment.
-func ClearCallerID(client *http.Client) {
+func ClearSessionID(client *http.Client) {
 	if t, ok := client.Transport.(*tenetTransport); ok {
-		t.callerID.Store("")
+		t.sessionID.Store("")
+	}
+}
+
+// SetSessionTags attaches cohort tags to the wrapped client's session. Safe
+// for concurrent use.
+func SetSessionTags(client *http.Client, tags []string) {
+	if t, ok := client.Transport.(*tenetTransport); ok {
+		t.sessionTags.Store(tags)
+	}
+}
+
+// ClearSessionTags removes the session tags.
+func ClearSessionTags(client *http.Client) {
+	if t, ok := client.Transport.(*tenetTransport); ok {
+		t.sessionTags.Store([]string{})
 	}
 }
 
@@ -153,8 +183,11 @@ func (t *tenetTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	proxyReq.Header.Set("X-Tenet-Key", t.tenetKey)
 	proxyReq.Header.Set("X-Provider-URL", originalURL)
 
-	if id, ok := t.callerID.Load().(string); ok && id != "" {
-		proxyReq.Header.Set("X-Caller-ID", id)
+	if id, ok := t.sessionID.Load().(string); ok && id != "" {
+		proxyReq.Header.Set("X-Tenet-Session-Id", id)
+	}
+	if tags, ok := t.sessionTags.Load().([]string); ok && len(tags) > 0 {
+		proxyReq.Header.Set("X-Tenet-Session-Tags", strings.Join(tags, ","))
 	}
 
 	resp, err := t.inner.RoundTrip(proxyReq)
@@ -195,11 +228,11 @@ func (t *tenetTransport) emitAttribution(a Attribution) {
 }
 
 func (t *tenetTransport) reportTelemetry(errMsg string) {
-	callerID, _ := t.callerID.Load().(string)
+	sessionID, _ := t.sessionID.Load().(string)
 	body, _ := json.Marshal(map[string]string{
 		"type":      "failover",
 		"timestamp": time.Now().UTC().Format(time.RFC3339),
-		"caller_id": callerID,
+		"caller_id": sessionID,
 		"error":     errMsg,
 	})
 
