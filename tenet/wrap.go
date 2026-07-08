@@ -230,10 +230,10 @@ func (t *tenetTransport) emitAttribution(a Attribution) {
 func (t *tenetTransport) reportTelemetry(errMsg string) {
 	sessionID, _ := t.sessionID.Load().(string)
 	body, _ := json.Marshal(map[string]string{
-		"type":       "failover",
-		"timestamp":  time.Now().UTC().Format(time.RFC3339),
-		"session_id": sessionID,
-		"error":      errMsg,
+		"type":      "failover",
+		"timestamp": time.Now().UTC().Format(time.RFC3339),
+		"caller_id": sessionID,
+		"error":     errMsg,
 	})
 
 	go func() {
