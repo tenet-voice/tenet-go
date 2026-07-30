@@ -6,7 +6,32 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestValidateConfig(t *testing.T) {
+	tests := []struct {
+		name   string
+		config Config
+	}{
+		{name: "missing key", config: Config{}},
+		{name: "invalid proxy URL", config: Config{TenetKey: "tk_test", ProxyURL: "not-a-url"}},
+		{name: "negative timeout", config: Config{TenetKey: "tk_test", Timeout: -time.Second}},
+		{name: "invalid session tag", config: Config{TenetKey: "tk_test", SessionTags: []string{"beta,internal"}}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := ValidateConfig(tt.config); err == nil {
+				t.Fatal("ValidateConfig() error = nil, want error")
+			}
+		})
+	}
+
+	if err := ValidateConfig(Config{TenetKey: "tk_test"}); err != nil {
+		t.Fatalf("ValidateConfig() error = %v, want nil", err)
+	}
+}
 
 func TestRewritesURL(t *testing.T) {
 	var gotURL string

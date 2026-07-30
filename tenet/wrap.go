@@ -21,6 +21,7 @@ package tenet
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -87,9 +88,42 @@ type tenetTransport struct {
 	tenetKey      string
 	proxyURL      string
 	failover      bool
+	configErr     error
 	sessionID     atomic.Value
 	sessionTags   atomic.Value
 	onAttribution func(Attribution)
+}
+
+// ValidateConfig checks caller-supplied SDK configuration before it can be
+// copied into outbound URLs and headers.
+func ValidateConfig(config Config) error {
+	if strings.TrimSpace(config.TenetKey) == "" {
+		return fmt.Errorf("tenet: TenetKey is required")
+	}
+	if config.Timeout < 0 {
+		return fmt.Errorf("tenet: Timeout cannot be negative")
+	}
+	if config.SessionID != "" && strings.ContainsAny(config.SessionID, "\r\n") {
+		return fmt.Errorf("tenet: SessionID cannot contain line breaks")
+	}
+	for i, tag := range config.SessionTags {
+		if strings.TrimSpace(tag) == "" {
+			return fmt.Errorf("tenet: SessionTags[%d] cannot be empty", i)
+		}
+		if strings.ContainsAny(tag, ",\r\n") {
+			return fmt.Errorf("tenet: SessionTags[%d] cannot contain commas or line breaks", i)
+		}
+	}
+
+	proxyURL := config.ProxyURL
+	if proxyURL == "" {
+		proxyURL = defaultProxyURL
+	}
+	parsed, err := url.Parse(proxyURL)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return fmt.Errorf("tenet: ProxyURL must be an absolute HTTP(S) URL")
+	}
+	return nil
 }
 
 // WrapHTTPClient returns a new [http.Client] whose transport routes requests
@@ -114,14 +148,19 @@ func WrapHTTPClient(client *http.Client, config Config) *http.Client {
 		tenetKey:      config.TenetKey,
 		proxyURL:      proxyURL,
 		failover:      config.Failover,
+		configErr:     ValidateConfig(config),
 		onAttribution: config.OnAttribution,
 	}
 	t.sessionID.Store(config.SessionID)
 	t.sessionTags.Store(config.SessionTags)
 
+	timeout := client.Timeout
+	if config.Timeout > 0 {
+		timeout = config.Timeout
+	}
 	return &http.Client{
 		Transport: t,
-		Timeout:   client.Timeout,
+		Timeout:   timeout,
 	}
 }
 
@@ -158,6 +197,9 @@ func ClearSessionTags(client *http.Client) {
 }
 
 func (t *tenetTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t.configErr != nil {
+		return nil, t.configErr
+	}
 	originalURL := req.URL.String()
 
 	var bodyBytes []byte
