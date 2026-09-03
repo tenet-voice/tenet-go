@@ -8,6 +8,7 @@
 //		option.WithAPIKey(os.Getenv("OPENAI_API_KEY")),
 //		option.WithHTTPClient(tenet.WrapHTTPClient(http.DefaultClient, tenet.Config{
 //			TenetKey:    os.Getenv("TENET_API_KEY"),
+//			AgentID:     "my-agent",
 //			SessionID:   "caller_123",
 //			SessionTags: []string{"beta", "internal"},
 //		})),
@@ -36,6 +37,9 @@ const defaultProxyURL = "https://inference.trytenet.ai"
 type Config struct {
 	// TenetKey authenticates requests to the Tenet proxy.
 	TenetKey string
+
+	// AgentID identifies the agent making the request for profile routing.
+	AgentID string
 
 	// SessionID identifies the caller/session for sticky A/B routing. The
 	// proxy uses this to ensure the same session always hits the same model
@@ -89,6 +93,7 @@ type tenetTransport struct {
 	proxyURL      string
 	failover      bool
 	configErr     error
+	agentID       atomic.Value
 	sessionID     atomic.Value
 	sessionTags   atomic.Value
 	onAttribution func(Attribution)
@@ -102,6 +107,9 @@ func ValidateConfig(config Config) error {
 	}
 	if config.Timeout < 0 {
 		return fmt.Errorf("tenet: Timeout cannot be negative")
+	}
+	if config.AgentID != "" && strings.ContainsAny(config.AgentID, "\r\n") {
+		return fmt.Errorf("tenet: AgentID cannot contain line breaks")
 	}
 	if config.SessionID != "" && strings.ContainsAny(config.SessionID, "\r\n") {
 		return fmt.Errorf("tenet: SessionID cannot contain line breaks")
@@ -151,6 +159,7 @@ func WrapHTTPClient(client *http.Client, config Config) *http.Client {
 		configErr:     ValidateConfig(config),
 		onAttribution: config.OnAttribution,
 	}
+	t.agentID.Store(config.AgentID)
 	t.sessionID.Store(config.SessionID)
 	t.sessionTags.Store(config.SessionTags)
 
@@ -161,6 +170,21 @@ func WrapHTTPClient(client *http.Client, config Config) *http.Client {
 	return &http.Client{
 		Transport: t,
 		Timeout:   timeout,
+	}
+}
+
+// SetAgentID identifies the agent making subsequent requests. Safe for
+// concurrent use.
+func SetAgentID(client *http.Client, id string) {
+	if t, ok := client.Transport.(*tenetTransport); ok {
+		t.agentID.Store(id)
+	}
+}
+
+// ClearAgentID removes the agent identifier from subsequent requests.
+func ClearAgentID(client *http.Client) {
+	if t, ok := client.Transport.(*tenetTransport); ok {
+		t.agentID.Store("")
 	}
 }
 
@@ -225,6 +249,9 @@ func (t *tenetTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	proxyReq.Header.Set("X-Tenet-Key", t.tenetKey)
 	proxyReq.Header.Set("X-Provider-URL", originalURL)
 
+	if id, ok := t.agentID.Load().(string); ok && id != "" {
+		proxyReq.Header.Set("X-Tenet-Agent-ID", id)
+	}
 	if id, ok := t.sessionID.Load().(string); ok && id != "" {
 		proxyReq.Header.Set("X-Tenet-Session-Id", id)
 	}
