@@ -17,6 +17,7 @@ func TestValidateConfig(t *testing.T) {
 		{name: "missing key", config: Config{}},
 		{name: "invalid proxy URL", config: Config{TenetKey: "tk_test", ProxyURL: "not-a-url"}},
 		{name: "negative timeout", config: Config{TenetKey: "tk_test", Timeout: -time.Second}},
+		{name: "invalid agent ID", config: Config{TenetKey: "tk_test", AgentID: "agent\nother"}},
 		{name: "invalid session tag", config: Config{TenetKey: "tk_test", SessionTags: []string{"beta,internal"}}},
 	}
 
@@ -123,6 +124,29 @@ func TestInjectsProviderURL(t *testing.T) {
 
 	if gotHeader != "https://api.groq.com/openai/v1/chat/completions" {
 		t.Errorf("expected groq URL, got %s", gotHeader)
+	}
+}
+
+func TestInjectsAgentID(t *testing.T) {
+	var gotHeader string
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeader = r.Header.Get("X-Tenet-Agent-ID")
+		w.Write([]byte(`{"choices":[]}`))
+	}))
+	defer proxy.Close()
+
+	client := WrapHTTPClient(http.DefaultClient, Config{
+		TenetKey: "tk_xxx",
+		ProxyURL: proxy.URL,
+	})
+	SetAgentID(client, "my-agent")
+
+	req, _ := http.NewRequest("POST", "https://api.openai.com/v1/chat/completions",
+		strings.NewReader(`{}`))
+	client.Do(req)
+
+	if gotHeader != "my-agent" {
+		t.Errorf("expected my-agent, got %s", gotHeader)
 	}
 }
 

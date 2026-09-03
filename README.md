@@ -49,6 +49,13 @@ tenet.ClearSessionID(httpClient)
 
 Session IDs are hashed (FNV-1a) against configured variant weights. Without a session ID, each request is independently routed by weight.
 
+Identify the agent for profile routing:
+
+```go
+tenet.SetAgentID(httpClient, "my-agent")
+tenet.ClearAgentID(httpClient)
+```
+
 You can also attach cohort tags to a session (e.g. for cohort-based analysis or routing):
 
 ```go
@@ -57,7 +64,7 @@ tenet.SetSessionTags(httpClient, []string{"beta", "internal"})
 tenet.ClearSessionTags(httpClient)
 ```
 
-Both `SessionID` and `SessionTags` can also be set at construction time via `Config`.
+`AgentID`, `SessionID`, and `SessionTags` can also be set at construction time via `Config`.
 
 ## Failover
 
@@ -124,6 +131,7 @@ for stream.Next() {
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `TenetKey` | `string` | required | API key for the Tenet proxy |
+| `AgentID` | `string` | `""` | Agent identifier used for profile routing |
 | `SessionID` | `string` | `""` | Session identifier for sticky A/B routing |
 | `SessionTags` | `[]string` | `nil` | Cohort tags attached to the session |
 | `ProxyURL` | `string` | `https://inference.trytenet.ai` | Proxy endpoint (override for self-hosted or staging) |
