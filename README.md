@@ -1,18 +1,18 @@
 # Tenet Go SDK
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/tenet-voice/tenet-go.svg)](https://pkg.go.dev/github.com/tenet-voice/tenet-go)
+[![Go Reference](https://pkg.go.dev/badge/github.com/tenet-voice/tenet-go/v2.svg)](https://pkg.go.dev/github.com/tenet-voice/tenet-go/v2)
 
-Route OpenAI-compatible LLM calls through [Tenet](https://trytenet.ai) for production observability, A/B model routing, and automatic failover — in one line.
+Send your agent's chat completions to a [Tenet](https://trytenet.ai) Project, keep your own provider as the failover, and fetch the Project's prompts.
 
 ## Install
 
 ```bash
-go get github.com/tenet-voice/tenet-go
+go get github.com/tenet-voice/tenet-go/v2
 ```
 
 ## Quick start
 
-Wrap your existing HTTP client. Everything else stays the same.
+Wrap the HTTP client of your existing OpenAI client. The client keeps its provider, key and model: they are what serves a request when Tenet cannot.
 
 ```go
 import (
@@ -21,148 +21,114 @@ import (
 
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
-	"github.com/tenet-voice/tenet-go/tenet"
+	"github.com/tenet-voice/tenet-go/v2/tenet"
 )
 
+httpClient := tenet.WrapHTTPClient(http.DefaultClient, tenet.Config{
+	Key:      os.Getenv("TENET_API_KEY"), // sk-tnt-…
+	Project:  "support-agent",
+	Failover: true,
+})
 client := openai.NewClient(
 	option.WithAPIKey(os.Getenv("OPENAI_API_KEY")),
-	option.WithHTTPClient(tenet.WrapHTTPClient(http.DefaultClient, tenet.Config{
-		TenetKey: os.Getenv("TENET_API_KEY"),
-		Failover: true,
-	})),
+	option.WithHTTPClient(httpClient),
 )
 ```
 
-That's it. All requests — including streaming — are transparently proxied through Tenet. Your code, types, and error handling don't change.
+Every chat completion, streaming included, now goes to Tenet as model `support-agent`, which serves the Project's `production` version. Your messages, tools and prompt pass through unchanged.
 
-## A/B routing
+## Choosing a version
 
-Tenet supports per-session sticky model routing for A/B tests. Attach a session ID and the proxy consistently routes that session to the same model variant:
+`Tag` picks which Project version serves:
 
-```go
-// Sticky routing — same session always hits the same variant
-tenet.SetSessionID(httpClient, "caller_123")
+| `Tag` | Serves |
+|-------|--------|
+| `""` | `production` |
+| `latest` | the newest version |
+| a branch name | that branch's newest version |
+| a custom tag | the version you tagged |
+| `v12` | exactly version 12 |
 
-// Back to weighted-random
-tenet.ClearSessionID(httpClient)
-```
+Tenet's staging endpoint (set `BaseURL`) serves every version under all of its tags. Production serves only the released version, as `production`.
 
-Session IDs are hashed (FNV-1a) against configured variant weights. Without a session ID, each request is independently routed by weight.
+## Prompts
 
-Identify the agent for profile routing:
-
-```go
-tenet.SetAgentID(httpClient, "my-agent")
-tenet.ClearAgentID(httpClient)
-```
-
-You can also attach cohort tags to a session (e.g. for cohort-based analysis or routing):
+Store your prompt in the Project's prompt store, tag a version `production`, and fetch it at the start of each call. Tenet never renders the text, so templates (Jinja or anything else) stay yours to fill:
 
 ```go
-tenet.SetSessionTags(httpClient, []string{"beta", "internal"})
-
-tenet.ClearSessionTags(httpClient)
+prompt, err := tenet.GetPrompt(ctx, httpClient, config, "") // "" means production
+if errors.Is(err, tenet.ErrPromptNotFound) {
+	// nothing is tagged production yet
+}
+system := render(prompt.Text, vars) // prompt.Version says which version you got
 ```
 
-`AgentID`, `SessionID`, and `SessionTags` can also be set at construction time via `Config`.
+`GetPrompt` makes one request. If your agent must start when Tenet is unreachable, keep your own copy of the last prompt you fetched.
 
 ## Failover
 
-With `Failover: true`, the SDK automatically falls back to calling your provider directly if the proxy is unreachable or returns a 5xx:
+Tenet answers with the Project's fallback model when the requested version fails. With `Failover: true`, the SDK also handles Tenet itself being unreachable or returning a 5xx by sending your original request, unchanged, to your provider:
 
 ```
-Request → Tenet Proxy → Provider
-              ↓ (5xx or network error)
-         Direct to Provider
+Request → Tenet (version, or Tenet's fallback)
+            ↓ network error or 5xx
+       Your provider, original request
 ```
 
-4xx errors (auth failures, bad requests) are returned as-is — they indicate a real problem, not a proxy issue.
+A 4xx (bad key, unknown Project or tag, invalid request) is returned as is. Failovers are reported in the background to `POST /v1/telemetry`.
 
-Failover events are reported asynchronously to `POST /v1/telemetry` for monitoring.
+Requests other than chat completions (embeddings, audio, …) go to your provider directly.
+
+## Sessions
+
+Session details are recorded with the traffic Tenet captures, so calls group into sessions in Studio. They never change which version serves.
+
+```go
+tenet.SetSessionID(httpClient, "call_123")
+tenet.SetSessionTags(httpClient, []string{"beta"})
+tenet.SetAgentID(httpClient, "front-desk")
+```
+
+They can also be set in `Config`.
 
 ## Attribution
 
-Set `OnAttribution` to learn how each request was served — without coupling your code to Tenet's response-header names. The callback fires once per request:
+`OnAttribution` is called once per chat completion:
 
 ```go
-client := tenet.WrapHTTPClient(http.DefaultClient, tenet.Config{
-	TenetKey: os.Getenv("TENET_API_KEY"),
-	Failover: true,
-	OnAttribution: func(a tenet.Attribution) {
-		// a.Mode:           "passthrough" | "replacement" | "managed"
-		// a.ServedVariant:  which variant served the request
-		// a.MatchedProfile: which model profile matched (empty if none)
-		// a.FallbackUsed:   the proxy fell through to a backup variant
-		// a.ServedDirect:   the SDK bypassed Tenet (client-side failover)
-		log.Printf("served by %s (%s)", a.ServedVariant, a.Mode)
-	},
-})
+OnAttribution: func(a tenet.Attribution) {
+	// a.Version:      "support-agent:v12", or "" when Tenet's fallback served
+	// a.FallbackUsed: Tenet served with the Project's fallback model
+	// a.ServedDirect: the SDK failed over to your provider
+},
 ```
 
-The proxy reports `Mode`, `ServedVariant`, `MatchedProfile`, and `FallbackUsed` via `X-Tenet-*` response headers; the SDK parses them for you. On **client-side failover** (proxy unreachable or 5xx with `Failover: true`), the SDK didn't reach Tenet at all, so it reports `Attribution{ServedDirect: true}` with the other fields empty.
-
-For **streaming**, the callback fires when the response headers arrive (stream start), before the first token.
-
-Notes:
-
-- The callback runs **synchronously inside the request**. If you share one client across goroutines, make your callback concurrency-safe.
-- The callback carries no request context — scope **one wrapped client per caller** (each with its own closure) when you need to correlate attribution back to a specific call.
-- A `4xx`, or a `5xx` without failover, reaches the callback with whatever headers are present — usually an empty `Mode`. Treat empty `Mode` as "unknown / proxy error," not a served mode.
-
-## Streaming
-
-Streaming works transparently. The proxy forwards SSE chunks as they arrive from the upstream provider — no buffering, no re-encoding:
-
-```go
-stream := client.Chat.Completions.NewStreaming(ctx, openai.ChatCompletionNewParams{
-	Model:    "gpt-4o",
-	Messages: []openai.ChatCompletionMessageParamUnion{
-		openai.UserMessage("Hello"),
-	},
-})
-for stream.Next() {
-	chunk := stream.Current()
-	// chunks arrive in real-time, same as without Tenet
-}
-```
+For streaming it fires when the response headers arrive. It runs inside the request, so make it safe for concurrent use if the client is shared.
 
 ## Configuration
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `TenetKey` | `string` | required | API key for the Tenet proxy |
-| `AgentID` | `string` | `""` | Agent identifier used for profile routing |
-| `SessionID` | `string` | `""` | Session identifier for sticky A/B routing |
-| `SessionTags` | `[]string` | `nil` | Cohort tags attached to the session |
-| `ProxyURL` | `string` | `https://inference.trytenet.ai` | Proxy endpoint (override for self-hosted or staging) |
-| `Failover` | `bool` | `false` | Fall back to direct provider on proxy failure |
-| `Timeout` | `time.Duration` | `0` (no timeout) | HTTP client timeout |
-| `OnAttribution` | `func(Attribution)` | `nil` | Called once per request with how the proxy served it |
+| `Key` | `string` | required | Tenet key (`sk-tnt-…`) |
+| `Project` | `string` | required | Tenet Project ID |
+| `Tag` | `string` | `production` | Version tag to serve |
+| `BaseURL` | `string` | `https://inference.trytenet.ai` | Tenet endpoint |
+| `Failover` | `bool` | `false` | Send to your provider when Tenet cannot answer |
+| `Timeout` | `time.Duration` | wrapped client's | HTTP client timeout |
+| `AgentID`, `SessionID`, `SessionTags` | | empty | Recorded with captured traffic |
+| `OnAttribution` | `func(Attribution)` | `nil` | Called once per chat completion |
 
-## How it works
+## Without the SDK
 
-`WrapHTTPClient` replaces the transport on your `*http.Client`. On each request, the transport:
+Tenet speaks the OpenAI Chat Completions API. Any OpenAI-compatible client works with base URL `https://inference.trytenet.ai/v1`, your `sk-tnt-…` key as the API key, and model `<project>[:<tag>]`. The SDK adds client-side failover, prompts and attribution.
 
-1. Buffers the request body (for potential failover replay)
-2. Rewrites the URL to point at the Tenet proxy
-3. Injects `X-Tenet-Key` (auth) and `X-Provider-URL` (original destination)
-4. Optionally injects `X-Tenet-Session-Id` and `X-Tenet-Session-Tags` for sticky routing
-5. Sends the request through the proxy
-6. On 5xx or network error (with failover enabled), replays to the original URL
-7. Parses the proxy's `X-Tenet-*` response headers into an `Attribution` and invokes `OnAttribution` (if set)
+## Upgrading from v1
 
-Your provider credentials (`Authorization` header) pass through untouched.
-
-## Works with any OpenAI-compatible provider
-
-The SDK proxies raw HTTP — it doesn't parse or transform requests. Any provider that speaks the OpenAI API format works:
-
-- OpenAI
-- Azure OpenAI
-- Groq
-- Together AI
-- Fireworks
-- Any OpenAI-compatible endpoint
+- Module path is `github.com/tenet-voice/tenet-go/v2`.
+- `TenetKey` is `Key` and must be a `sk-tnt-…` key; `ProxyURL` is `BaseURL`.
+- Add `Project` (and `Tag` if not `production`). The model your client sends is kept only for failover.
+- `Attribution` has `Version`, `FallbackUsed`, `ServedDirect`; `Mode`, `ServedVariant` and `MatchedProfile` are gone.
+- `Clear*` helpers are gone; call `Set*` with an empty value.
 
 ## License
 

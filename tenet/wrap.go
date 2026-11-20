@@ -1,22 +1,23 @@
-// Package tenet routes OpenAI-compatible HTTP requests through the Tenet
-// inference proxy for production observability, A/B model routing, and
-// automatic failover.
+// Package tenet sends an OpenAI-compatible client's chat completions to a
+// Tenet Project, and fetches the Project's prompts.
 //
-// Usage is a single-line change to any [github.com/openai/openai-go] client:
+// Wrap the HTTP client of any [github.com/openai/openai-go] client. The client
+// keeps its own provider, key and model; those are the failover:
 //
 //	client := openai.NewClient(
 //		option.WithAPIKey(os.Getenv("OPENAI_API_KEY")),
 //		option.WithHTTPClient(tenet.WrapHTTPClient(http.DefaultClient, tenet.Config{
-//			TenetKey:    os.Getenv("TENET_API_KEY"),
-//			AgentID:     "my-agent",
-//			SessionID:   "caller_123",
-//			SessionTags: []string{"beta", "internal"},
+//			Key:      os.Getenv("TENET_API_KEY"),
+//			Project:  "support-agent",
+//			Failover: true,
 //		})),
 //	)
 //
-// All requests — including streaming — are transparently proxied. If the proxy
-// is unreachable or returns a 5xx, the SDK falls back to calling the provider
-// directly so your agent never goes silent.
+// Every chat completion, streaming included, goes to Tenet as model
+// "<Project>[:<Tag>]". Tenet serves the version the tag names, and its own
+// fallback model when that version fails. With Failover set, a request Tenet
+// cannot answer (network error or 5xx) is sent unchanged to the provider.
+// Requests other than chat completions go to the provider directly.
 package tenet
 
 import (
@@ -26,95 +27,124 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"time"
 )
 
-const defaultProxyURL = "https://inference.trytenet.ai"
+const defaultBaseURL = "https://inference.trytenet.ai"
 
-// Config holds settings for the Tenet proxy transport.
+// name is what a Project ID or tag may hold in a model name; Tenet checks
+// the rest.
+var name = regexp.MustCompile(`^[^\s:/]+$`)
+
+// Config holds settings for the Tenet transport.
 type Config struct {
-	// TenetKey authenticates requests to the Tenet proxy.
-	TenetKey string
+	// Key is the Organization's Tenet key (sk-tnt-…).
+	Key string
 
-	// AgentID identifies the agent making the request for profile routing.
-	AgentID string
+	// Project is the Tenet Project requests are sent to.
+	Project string
 
-	// SessionID identifies the caller/session for sticky A/B routing. The
-	// proxy uses this to ensure the same session always hits the same model
-	// variant (via FNV-1a hash).
-	SessionID string
+	// Tag names the Project version to serve: production (the default),
+	// latest, a branch, a custom tag, or vN.
+	Tag string
 
-	// SessionTags attaches cohort tags to the session (e.g. for cohort-based
-	// routing or analysis).
-	SessionTags []string
+	// BaseURL overrides the Tenet endpoint (https://inference.trytenet.ai),
+	// for example to use staging.
+	BaseURL string
 
-	// ProxyURL overrides the default proxy endpoint (https://inference.trytenet.ai).
-	// Use this for self-hosted or staging deployments.
-	ProxyURL string
-
-	// Failover controls whether the SDK falls back to calling the provider
-	// directly when the proxy is unreachable or returns a 5xx. Default is false;
-	// set to true for production resilience.
+	// Failover sends a request unchanged to the provider when Tenet is
+	// unreachable or returns a 5xx.
 	Failover bool
 
-	// Timeout sets the HTTP client timeout. Zero means no timeout.
+	// Timeout sets the HTTP client timeout. Zero keeps the wrapped client's.
 	Timeout time.Duration
 
-	// OnAttribution, if set, is called once per request with how the proxy
-	// served it. On client-side failover it is called with ServedDirect:true.
+	// AgentID, SessionID and SessionTags are recorded with captured traffic
+	// for analysis. They do not change which version serves.
+	AgentID     string
+	SessionID   string
+	SessionTags []string
+
+	// OnAttribution, if set, is called once per chat completion with how it
+	// was served.
 	OnAttribution func(Attribution)
 }
 
-// Attribution describes how the proxy served a request, parsed from the
-// X-Tenet-* response headers. ServedDirect is set by the SDK (not a header)
-// when it failed over to the provider directly, bypassing Tenet.
+// Attribution describes how a chat completion was served.
 type Attribution struct {
-	Mode           string // "passthrough" | "replacement" | "managed"
-	ServedVariant  string
-	MatchedProfile string
-	FallbackUsed   bool
-	ServedDirect   bool
+	// Version is the version that served it as "<project>:v<N>", from
+	// X-Tenet-Served-Version; empty when Tenet's fallback model did.
+	Version string
+	// FallbackUsed reports that Tenet served it with the Project's fallback.
+	FallbackUsed bool
+	// ServedDirect reports that the SDK failed over to the provider.
+	ServedDirect bool
 }
 
 func parseAttribution(h http.Header) Attribution {
 	return Attribution{
-		Mode:           h.Get("X-Tenet-Mode"),
-		ServedVariant:  h.Get("X-Tenet-Served-Variant"),
-		MatchedProfile: h.Get("X-Tenet-Matched-Profile"),
-		FallbackUsed:   h.Get("X-Tenet-Fallback-Used") == "true",
+		Version:      h.Get("X-Tenet-Served-Version"),
+		FallbackUsed: h.Get("X-Tenet-Fallback-Used") == "true",
 	}
 }
 
-type tenetTransport struct {
-	inner         http.RoundTripper
-	tenetKey      string
-	proxyURL      string
-	failover      bool
-	configErr     error
-	agentID       atomic.Value
-	sessionID     atomic.Value
-	sessionTags   atomic.Value
-	onAttribution func(Attribution)
+// Model is the model name a chat completion is sent to Tenet with.
+func (c Config) Model() string {
+	if c.Tag == "" {
+		return c.Project
+	}
+	return c.Project + ":" + c.Tag
 }
 
-// ValidateConfig checks caller-supplied SDK configuration before it can be
-// copied into outbound URLs and headers.
+func (c Config) baseURL() string {
+	if c.BaseURL == "" {
+		return defaultBaseURL
+	}
+	return strings.TrimRight(c.BaseURL, "/")
+}
+
+// ValidateConfig checks a Config before its values reach URLs and headers.
 func ValidateConfig(config Config) error {
-	if strings.TrimSpace(config.TenetKey) == "" {
-		return fmt.Errorf("tenet: TenetKey is required")
+	if !strings.HasPrefix(strings.TrimSpace(config.Key), "sk-tnt-") {
+		return fmt.Errorf("tenet: Key must be a Tenet key (sk-tnt-…)")
+	}
+	if !name.MatchString(config.Project) {
+		return fmt.Errorf("tenet: Project is required and cannot contain spaces, ':' or '/'")
+	}
+	if config.Tag != "" && !name.MatchString(config.Tag) {
+		return fmt.Errorf("tenet: Tag cannot contain spaces, ':' or '/'")
 	}
 	if config.Timeout < 0 {
 		return fmt.Errorf("tenet: Timeout cannot be negative")
 	}
-	if config.AgentID != "" && strings.ContainsAny(config.AgentID, "\r\n") {
-		return fmt.Errorf("tenet: AgentID cannot contain line breaks")
+	if err := checkHeaderValue("AgentID", config.AgentID); err != nil {
+		return err
 	}
-	if config.SessionID != "" && strings.ContainsAny(config.SessionID, "\r\n") {
-		return fmt.Errorf("tenet: SessionID cannot contain line breaks")
+	if err := checkHeaderValue("SessionID", config.SessionID); err != nil {
+		return err
 	}
-	for i, tag := range config.SessionTags {
+	if err := checkSessionTags(config.SessionTags); err != nil {
+		return err
+	}
+	parsed, err := url.Parse(config.baseURL())
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return fmt.Errorf("tenet: BaseURL must be an absolute HTTP(S) URL")
+	}
+	return nil
+}
+
+func checkHeaderValue(field, value string) error {
+	if strings.ContainsAny(value, "\r\n") {
+		return fmt.Errorf("tenet: %s cannot contain line breaks", field)
+	}
+	return nil
+}
+
+func checkSessionTags(tags []string) error {
+	for i, tag := range tags {
 		if strings.TrimSpace(tag) == "" {
 			return fmt.Errorf("tenet: SessionTags[%d] cannot be empty", i)
 		}
@@ -122,40 +152,30 @@ func ValidateConfig(config Config) error {
 			return fmt.Errorf("tenet: SessionTags[%d] cannot contain commas or line breaks", i)
 		}
 	}
-
-	proxyURL := config.ProxyURL
-	if proxyURL == "" {
-		proxyURL = defaultProxyURL
-	}
-	parsed, err := url.Parse(proxyURL)
-	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
-		return fmt.Errorf("tenet: ProxyURL must be an absolute HTTP(S) URL")
-	}
 	return nil
 }
 
-// WrapHTTPClient returns a new [http.Client] whose transport routes requests
-// through the Tenet inference proxy. The original client's transport is
-// preserved and used for the underlying HTTP calls (and for failover).
-//
-// Pass the returned client to [github.com/openai/openai-go/option.WithHTTPClient]
-// or use it directly — any OpenAI-compatible HTTP request is supported.
-func WrapHTTPClient(client *http.Client, config Config) *http.Client {
-	proxyURL := config.ProxyURL
-	if proxyURL == "" {
-		proxyURL = defaultProxyURL
-	}
+type transport struct {
+	inner         http.RoundTripper
+	config        Config
+	configErr     error
+	agentID       atomic.Value
+	sessionID     atomic.Value
+	sessionTags   atomic.Value
+	onAttribution func(Attribution)
+}
 
+// WrapHTTPClient returns a new [http.Client] that sends chat completions to
+// the Tenet Project. The wrapped client's transport makes the underlying
+// calls, Tenet's and the provider's.
+func WrapHTTPClient(client *http.Client, config Config) *http.Client {
 	inner := client.Transport
 	if inner == nil {
 		inner = http.DefaultTransport
 	}
-
-	t := &tenetTransport{
+	t := &transport{
 		inner:         inner,
-		tenetKey:      config.TenetKey,
-		proxyURL:      proxyURL,
-		failover:      config.Failover,
+		config:        config,
 		configErr:     ValidateConfig(config),
 		onAttribution: config.OnAttribution,
 	}
@@ -167,148 +187,148 @@ func WrapHTTPClient(client *http.Client, config Config) *http.Client {
 	if config.Timeout > 0 {
 		timeout = config.Timeout
 	}
-	return &http.Client{
-		Transport: t,
-		Timeout:   timeout,
-	}
+	return &http.Client{Transport: t, Timeout: timeout, CheckRedirect: client.CheckRedirect, Jar: client.Jar}
 }
 
-// SetAgentID identifies the agent making subsequent requests. Safe for
+// SetAgentID records an agent identifier with subsequent requests. Safe for
 // concurrent use.
 func SetAgentID(client *http.Client, id string) {
-	if t, ok := client.Transport.(*tenetTransport); ok {
+	if t, ok := client.Transport.(*transport); ok {
 		t.agentID.Store(id)
 	}
 }
 
-// ClearAgentID removes the agent identifier from subsequent requests.
-func ClearAgentID(client *http.Client) {
-	if t, ok := client.Transport.(*tenetTransport); ok {
-		t.agentID.Store("")
-	}
-}
-
-// SetSessionID attaches a session identifier to the wrapped client for sticky
-// A/B routing. The proxy uses this to ensure the same session always hits the
-// same model variant (via FNV-1a hash). Safe for concurrent use.
+// SetSessionID records a session identifier with subsequent requests, so
+// Tenet groups them into one session. Safe for concurrent use.
 func SetSessionID(client *http.Client, id string) {
-	if t, ok := client.Transport.(*tenetTransport); ok {
+	if t, ok := client.Transport.(*transport); ok {
 		t.sessionID.Store(id)
 	}
 }
 
-// ClearSessionID removes the session identifier so subsequent requests use
-// per-request weighted-random routing instead of sticky assignment.
-func ClearSessionID(client *http.Client) {
-	if t, ok := client.Transport.(*tenetTransport); ok {
-		t.sessionID.Store("")
-	}
-}
-
-// SetSessionTags attaches cohort tags to the wrapped client's session. Safe
-// for concurrent use.
+// SetSessionTags records tags with subsequent requests' session. Safe for
+// concurrent use.
 func SetSessionTags(client *http.Client, tags []string) {
-	if t, ok := client.Transport.(*tenetTransport); ok {
-		t.sessionTags.Store(tags)
+	if t, ok := client.Transport.(*transport); ok {
+		t.sessionTags.Store(append([]string(nil), tags...))
 	}
 }
 
-// ClearSessionTags removes the session tags.
-func ClearSessionTags(client *http.Client) {
-	if t, ok := client.Transport.(*tenetTransport); ok {
-		t.sessionTags.Store([]string{})
-	}
-}
-
-func (t *tenetTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if t.configErr != nil {
 		return nil, t.configErr
 	}
-	originalURL := req.URL.String()
+	if req.Method != http.MethodPost || !strings.HasSuffix(req.URL.Path, "/chat/completions") {
+		return t.inner.RoundTrip(req)
+	}
 
-	var bodyBytes []byte
+	var original []byte
 	if req.Body != nil && req.Body != http.NoBody {
 		var err error
-		bodyBytes, err = io.ReadAll(req.Body)
+		original, err = io.ReadAll(req.Body)
 		req.Body.Close()
 		if err != nil {
 			return nil, err
 		}
 	}
-
-	proxyParsed, _ := url.Parse(t.proxyURL)
-	proxyReq := req.Clone(req.Context())
-	proxyReq.URL.Scheme = proxyParsed.Scheme
-	proxyReq.URL.Host = proxyParsed.Host
-	proxyReq.Host = proxyParsed.Host
-	if len(bodyBytes) > 0 {
-		proxyReq.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-		proxyReq.ContentLength = int64(len(bodyBytes))
-	}
-
-	proxyReq.Header.Set("X-Tenet-Key", t.tenetKey)
-	proxyReq.Header.Set("X-Provider-URL", originalURL)
-
-	if id, ok := t.agentID.Load().(string); ok && id != "" {
-		proxyReq.Header.Set("X-Tenet-Agent-ID", id)
-	}
-	if id, ok := t.sessionID.Load().(string); ok && id != "" {
-		proxyReq.Header.Set("X-Tenet-Session-Id", id)
-	}
-	if tags, ok := t.sessionTags.Load().([]string); ok && len(tags) > 0 {
-		proxyReq.Header.Set("X-Tenet-Session-Tags", strings.Join(tags, ","))
-	}
-
-	resp, err := t.inner.RoundTrip(proxyReq)
+	body, err := withModel(original, t.config.Model())
 	if err != nil {
-		if t.failover {
-			t.reportTelemetry(err.Error())
-			t.emitAttribution(Attribution{ServedDirect: true})
-			fallbackReq := req.Clone(req.Context())
-			if len(bodyBytes) > 0 {
-				fallbackReq.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-				fallbackReq.ContentLength = int64(len(bodyBytes))
-			}
-			return t.inner.RoundTrip(fallbackReq)
-		}
+		return nil, err
+	}
+	tenetReq, err := t.tenetRequest(req, body)
+	if err != nil {
 		return nil, err
 	}
 
-	if resp.StatusCode >= 500 && t.failover {
+	resp, err := t.inner.RoundTrip(tenetReq)
+	switch {
+	case err != nil && t.failover():
+		return t.direct(req, original, err.Error())
+	case err != nil:
+		return nil, err
+	case resp.StatusCode >= 500 && t.failover():
+		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
-		t.reportTelemetry("proxy returned " + resp.Status)
-		t.emitAttribution(Attribution{ServedDirect: true})
-		fallbackReq := req.Clone(req.Context())
-		if len(bodyBytes) > 0 {
-			fallbackReq.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-			fallbackReq.ContentLength = int64(len(bodyBytes))
-		}
-		return t.inner.RoundTrip(fallbackReq)
+		return t.direct(req, original, "tenet returned "+resp.Status)
 	}
-
-	t.emitAttribution(parseAttribution(resp.Header))
+	t.emit(parseAttribution(resp.Header))
 	return resp, nil
 }
 
-func (t *tenetTransport) emitAttribution(a Attribution) {
+func (t *transport) failover() bool { return t.config.Failover }
+
+// tenetRequest is req sent to Tenet's chat completions endpoint with the
+// Tenet key in place of the provider's.
+func (t *transport) tenetRequest(req *http.Request, body []byte) (*http.Request, error) {
+	out, err := http.NewRequestWithContext(req.Context(), http.MethodPost, t.config.baseURL()+"/v1/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	for key, values := range req.Header {
+		if strings.EqualFold(key, "Authorization") || strings.EqualFold(key, "Api-Key") {
+			continue
+		}
+		out.Header[key] = values
+	}
+	out.Header.Set("Authorization", "Bearer "+strings.TrimSpace(t.config.Key))
+	out.Header.Set("Content-Type", "application/json")
+	if id, _ := t.agentID.Load().(string); id != "" {
+		out.Header.Set("X-Tenet-Agent-ID", id)
+	}
+	if id, _ := t.sessionID.Load().(string); id != "" {
+		out.Header.Set("X-Tenet-Session-Id", id)
+	}
+	if tags, _ := t.sessionTags.Load().([]string); len(tags) > 0 && checkSessionTags(tags) == nil {
+		out.Header.Set("X-Tenet-Session-Tags", strings.Join(tags, ","))
+	}
+	return out, nil
+}
+
+// direct sends the original request to the provider.
+func (t *transport) direct(req *http.Request, original []byte, reason string) (*http.Response, error) {
+	t.reportFailover(reason)
+	t.emit(Attribution{ServedDirect: true})
+	out := req.Clone(req.Context())
+	out.Body = io.NopCloser(bytes.NewReader(original))
+	out.ContentLength = int64(len(original))
+	return t.inner.RoundTrip(out)
+}
+
+// withModel is a chat completion body with its model replaced; every other
+// field is kept as sent.
+func withModel(body []byte, model string) ([]byte, error) {
+	fields := map[string]json.RawMessage{}
+	if len(body) > 0 {
+		if err := json.Unmarshal(body, &fields); err != nil {
+			return nil, fmt.Errorf("tenet: chat completion body is not a JSON object: %w", err)
+		}
+	}
+	encoded, _ := json.Marshal(model)
+	fields["model"] = encoded
+	return json.Marshal(fields)
+}
+
+func (t *transport) emit(a Attribution) {
 	if t.onAttribution != nil {
 		t.onAttribution(a)
 	}
 }
 
-func (t *tenetTransport) reportTelemetry(errMsg string) {
+// reportFailover tells Tenet, in the background, that a request bypassed it.
+func (t *transport) reportFailover(reason string) {
 	sessionID, _ := t.sessionID.Load().(string)
 	body, _ := json.Marshal(map[string]string{
 		"type":      "failover",
 		"timestamp": time.Now().UTC().Format(time.RFC3339),
 		"caller_id": sessionID,
-		"error":     errMsg,
+		"error":     reason,
 	})
-
 	go func() {
-		req, _ := http.NewRequest("POST", t.proxyURL+"/v1/telemetry",
-			bytes.NewReader(body))
-		req.Header.Set("X-Tenet-Key", t.tenetKey)
+		req, err := http.NewRequest(http.MethodPost, t.config.baseURL()+"/v1/telemetry", bytes.NewReader(body))
+		if err != nil {
+			return
+		}
+		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(t.config.Key))
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := t.inner.RoundTrip(req)
 		if err == nil {

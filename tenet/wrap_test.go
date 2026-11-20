@@ -1,279 +1,241 @@
 package tenet
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
-func TestValidateConfig(t *testing.T) {
-	tests := []struct {
-		name   string
-		config Config
-	}{
-		{name: "missing key", config: Config{}},
-		{name: "invalid proxy URL", config: Config{TenetKey: "tk_test", ProxyURL: "not-a-url"}},
-		{name: "negative timeout", config: Config{TenetKey: "tk_test", Timeout: -time.Second}},
-		{name: "invalid agent ID", config: Config{TenetKey: "tk_test", AgentID: "agent\nother"}},
-		{name: "invalid session tag", config: Config{TenetKey: "tk_test", SessionTags: []string{"beta,internal"}}},
-	}
+const testKey = "sk-tnt-test"
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if err := ValidateConfig(tt.config); err == nil {
-				t.Fatal("ValidateConfig() error = nil, want error")
+type recorded struct {
+	path, auth, sessionID, sessionTags, agentID, extra string
+	body                                               map[string]any
+}
+
+// server records the requests it gets and answers with status and headers.
+func server(t *testing.T, status int, headers map[string]string) (*httptest.Server, *[]recorded) {
+	t.Helper()
+	var mu sync.Mutex
+	var got []recorded
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var body map[string]any
+		_ = json.Unmarshal(raw, &body)
+		mu.Lock()
+		got = append(got, recorded{
+			path: r.URL.Path, auth: r.Header.Get("Authorization"),
+			sessionID: r.Header.Get("X-Tenet-Session-Id"), sessionTags: r.Header.Get("X-Tenet-Session-Tags"),
+			agentID: r.Header.Get("X-Tenet-Agent-ID"), extra: r.Header.Get("X-Extra"), body: body,
+		})
+		mu.Unlock()
+		for k, v := range headers {
+			w.Header().Set(k, v)
+		}
+		w.WriteHeader(status)
+		io.WriteString(w, `{"choices":[]}`)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &got
+}
+
+func chat(t *testing.T, client *http.Client, providerURL string) *http.Response {
+	t.Helper()
+	req, _ := http.NewRequest(http.MethodPost, providerURL+"/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}],"stream":true}`))
+	req.Header.Set("Authorization", "Bearer sk-provider")
+	req.Header.Set("X-Extra", "kept")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	return resp
+}
+
+func TestValidateConfig(t *testing.T) {
+	valid := Config{Key: testKey, Project: "support-agent"}
+	if err := ValidateConfig(valid); err != nil {
+		t.Fatalf("ValidateConfig(valid) = %v", err)
+	}
+	for name, mutate := range map[string]func(*Config){
+		"provider key":     func(c *Config) { c.Key = "sk-proj-123" },
+		"missing project":  func(c *Config) { c.Project = "" },
+		"project with tag": func(c *Config) { c.Project = "support:v2" },
+		"tag with space":   func(c *Config) { c.Tag = "a b" },
+		"bad base URL":     func(c *Config) { c.BaseURL = "not-a-url" },
+		"negative timeout": func(c *Config) { c.Timeout = -time.Second },
+		"session newline":  func(c *Config) { c.SessionID = "a\nb" },
+		"tag with comma":   func(c *Config) { c.SessionTags = []string{"a,b"} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			config := valid
+			mutate(&config)
+			if ValidateConfig(config) == nil {
+				t.Fatal("ValidateConfig() = nil, want an error")
 			}
 		})
 	}
+}
 
-	if err := ValidateConfig(Config{TenetKey: "tk_test"}); err != nil {
-		t.Fatalf("ValidateConfig() error = %v, want nil", err)
+func TestChatCompletionGoesToTheProject(t *testing.T) {
+	tenet, tenetGot := server(t, http.StatusOK, map[string]string{"X-Tenet-Served-Version": "v7"})
+	provider, providerGot := server(t, http.StatusOK, nil)
+	var attribution Attribution
+	client := WrapHTTPClient(http.DefaultClient, Config{
+		Key: testKey, Project: "support-agent", Tag: "canary", BaseURL: tenet.URL,
+		SessionID: "call-1", SessionTags: []string{"beta"}, AgentID: "front-desk",
+		OnAttribution: func(a Attribution) { attribution = a },
+	})
+	chat(t, client, provider.URL)
+
+	if len(*providerGot) != 0 {
+		t.Fatalf("provider got %d requests, want 0", len(*providerGot))
+	}
+	got := (*tenetGot)[0]
+	if got.path != "/v1/chat/completions" || got.auth != "Bearer "+testKey {
+		t.Fatalf("Tenet got path %q auth %q", got.path, got.auth)
+	}
+	if got.body["model"] != "support-agent:canary" || got.body["stream"] != true || got.body["messages"] == nil {
+		t.Fatalf("Tenet got body %v", got.body)
+	}
+	if got.sessionID != "call-1" || got.sessionTags != "beta" || got.agentID != "front-desk" || got.extra != "kept" {
+		t.Fatalf("Tenet got headers %+v", got)
+	}
+	if attribution != (Attribution{Version: "v7"}) {
+		t.Fatalf("attribution = %+v", attribution)
 	}
 }
 
-func TestRewritesURL(t *testing.T) {
-	var gotURL string
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotURL = r.URL.String()
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"choices":[]}`))
-	}))
-	defer proxy.Close()
-
-	client := WrapHTTPClient(http.DefaultClient, Config{
-		TenetKey: "tk_xxx",
-		ProxyURL: proxy.URL,
-	})
-
-	req, _ := http.NewRequest("POST", "https://api.openai.com/v1/chat/completions",
-		strings.NewReader(`{"model":"gpt-4o"}`))
-	req.Header.Set("Authorization", "Bearer sk_xxx")
-	client.Do(req)
-
-	if gotURL != "/v1/chat/completions" {
-		t.Errorf("expected /v1/chat/completions, got %s", gotURL)
+func TestBareProjectMeansProduction(t *testing.T) {
+	tenet, got := server(t, http.StatusOK, nil)
+	client := WrapHTTPClient(http.DefaultClient, Config{Key: testKey, Project: "support-agent", BaseURL: tenet.URL})
+	chat(t, client, "http://provider.invalid")
+	if model := (*got)[0].body["model"]; model != "support-agent" {
+		t.Fatalf("model = %v, want support-agent", model)
 	}
 }
 
-func TestInjectsTenetKey(t *testing.T) {
-	var gotHeader string
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotHeader = r.Header.Get("X-Tenet-Key")
-		w.Write([]byte(`{"choices":[]}`))
-	}))
-	defer proxy.Close()
-
+func TestFailoverSendsTheOriginalRequestToTheProvider(t *testing.T) {
+	tenet, _ := server(t, http.StatusBadGateway, nil)
+	provider, providerGot := server(t, http.StatusOK, nil)
+	var attribution Attribution
 	client := WrapHTTPClient(http.DefaultClient, Config{
-		TenetKey: "tk_xxx",
-		ProxyURL: proxy.URL,
+		Key: testKey, Project: "support-agent", BaseURL: tenet.URL, Failover: true,
+		OnAttribution: func(a Attribution) { attribution = a },
 	})
+	chat(t, client, provider.URL)
 
-	req, _ := http.NewRequest("POST", "https://api.openai.com/v1/chat/completions",
-		strings.NewReader(`{}`))
-	req.Header.Set("Authorization", "Bearer sk_xxx")
-	client.Do(req)
-
-	if gotHeader != "tk_xxx" {
-		t.Errorf("expected tk_xxx, got %s", gotHeader)
+	got := (*providerGot)[0]
+	if got.auth != "Bearer sk-provider" || got.body["model"] != "gpt-4.1" {
+		t.Fatalf("provider got auth %q model %v, want the original request", got.auth, got.body["model"])
+	}
+	if !attribution.ServedDirect {
+		t.Fatalf("attribution = %+v, want ServedDirect", attribution)
 	}
 }
 
-func TestPreservesAuth(t *testing.T) {
-	var gotAuth string
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotAuth = r.Header.Get("Authorization")
-		w.Write([]byte(`{"choices":[]}`))
-	}))
-	defer proxy.Close()
-
+func TestFailoverOnUnreachableTenet(t *testing.T) {
+	provider, providerGot := server(t, http.StatusOK, nil)
 	client := WrapHTTPClient(http.DefaultClient, Config{
-		TenetKey: "tk_xxx",
-		ProxyURL: proxy.URL,
+		Key: testKey, Project: "support-agent", BaseURL: "http://127.0.0.1:1", Failover: true,
 	})
-
-	req, _ := http.NewRequest("POST", "https://api.openai.com/v1/chat/completions",
-		strings.NewReader(`{}`))
-	req.Header.Set("Authorization", "Bearer sk_provider")
-	client.Do(req)
-
-	if gotAuth != "Bearer sk_provider" {
-		t.Errorf("expected Bearer sk_provider, got %s", gotAuth)
+	chat(t, client, provider.URL)
+	if len(*providerGot) != 1 {
+		t.Fatalf("provider got %d requests, want 1", len(*providerGot))
 	}
 }
 
-func TestInjectsProviderURL(t *testing.T) {
-	var gotHeader string
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotHeader = r.Header.Get("X-Provider-URL")
-		w.Write([]byte(`{"choices":[]}`))
-	}))
-	defer proxy.Close()
-
-	client := WrapHTTPClient(http.DefaultClient, Config{
-		TenetKey: "tk_xxx",
-		ProxyURL: proxy.URL,
-	})
-
-	req, _ := http.NewRequest("POST", "https://api.groq.com/openai/v1/chat/completions",
-		strings.NewReader(`{}`))
-	req.Header.Set("Authorization", "Bearer sk_xxx")
-	client.Do(req)
-
-	if gotHeader != "https://api.groq.com/openai/v1/chat/completions" {
-		t.Errorf("expected groq URL, got %s", gotHeader)
+func TestNoFailoverReturnsTenetsAnswer(t *testing.T) {
+	tenet, _ := server(t, http.StatusBadGateway, nil)
+	provider, providerGot := server(t, http.StatusOK, nil)
+	client := WrapHTTPClient(http.DefaultClient, Config{Key: testKey, Project: "support-agent", BaseURL: tenet.URL})
+	if resp := chat(t, client, provider.URL); resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", resp.StatusCode)
+	}
+	if len(*providerGot) != 0 {
+		t.Fatal("provider was called without Failover")
 	}
 }
 
-func TestInjectsAgentID(t *testing.T) {
-	var gotHeader string
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotHeader = r.Header.Get("X-Tenet-Agent-ID")
-		w.Write([]byte(`{"choices":[]}`))
-	}))
-	defer proxy.Close()
-
-	client := WrapHTTPClient(http.DefaultClient, Config{
-		TenetKey: "tk_xxx",
-		ProxyURL: proxy.URL,
-	})
-	SetAgentID(client, "my-agent")
-
-	req, _ := http.NewRequest("POST", "https://api.openai.com/v1/chat/completions",
-		strings.NewReader(`{}`))
-	client.Do(req)
-
-	if gotHeader != "my-agent" {
-		t.Errorf("expected my-agent, got %s", gotHeader)
+func TestClientErrorsAreNotFailedOver(t *testing.T) {
+	tenet, _ := server(t, http.StatusNotFound, nil)
+	provider, providerGot := server(t, http.StatusOK, nil)
+	client := WrapHTTPClient(http.DefaultClient, Config{Key: testKey, Project: "support-agent", BaseURL: tenet.URL, Failover: true})
+	if resp := chat(t, client, provider.URL); resp.StatusCode != http.StatusNotFound || len(*providerGot) != 0 {
+		t.Fatalf("status = %d, provider calls = %d; want 404 from Tenet", resp.StatusCode, len(*providerGot))
 	}
 }
 
-func TestInjectsSessionID(t *testing.T) {
-	var gotHeader string
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotHeader = r.Header.Get("X-Tenet-Session-Id")
-		w.Write([]byte(`{"choices":[]}`))
-	}))
-	defer proxy.Close()
-
-	client := WrapHTTPClient(http.DefaultClient, Config{
-		TenetKey: "tk_xxx",
-		ProxyURL: proxy.URL,
-	})
-	SetSessionID(client, "caller_123")
-
-	req, _ := http.NewRequest("POST", "https://api.openai.com/v1/chat/completions",
-		strings.NewReader(`{}`))
-	req.Header.Set("Authorization", "Bearer sk_xxx")
-	client.Do(req)
-
-	if gotHeader != "caller_123" {
-		t.Errorf("expected caller_123, got %s", gotHeader)
-	}
-}
-
-func TestInjectsSessionTags(t *testing.T) {
-	var gotHeader string
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotHeader = r.Header.Get("X-Tenet-Session-Tags")
-		w.Write([]byte(`{"choices":[]}`))
-	}))
-	defer proxy.Close()
-
-	client := WrapHTTPClient(http.DefaultClient, Config{
-		TenetKey: "tk_xxx",
-		ProxyURL: proxy.URL,
-	})
-	SetSessionTags(client, []string{"beta", "internal"})
-
-	req, _ := http.NewRequest("POST", "https://api.openai.com/v1/chat/completions",
-		strings.NewReader(`{}`))
-	req.Header.Set("Authorization", "Bearer sk_xxx")
-	client.Do(req)
-
-	if gotHeader != "beta,internal" {
-		t.Errorf("expected beta,internal, got %s", gotHeader)
-	}
-}
-
-func TestNoSessionIDWhenUnset(t *testing.T) {
-	var hasHeader bool
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, hasHeader = r.Header["X-Tenet-Session-Id"]
-		w.Write([]byte(`{"choices":[]}`))
-	}))
-	defer proxy.Close()
-
-	client := WrapHTTPClient(http.DefaultClient, Config{
-		TenetKey: "tk_xxx",
-		ProxyURL: proxy.URL,
-	})
-
-	req, _ := http.NewRequest("POST", "https://api.openai.com/v1/chat/completions",
-		strings.NewReader(`{}`))
-	req.Header.Set("Authorization", "Bearer sk_xxx")
-	client.Do(req)
-
-	if hasHeader {
-		t.Error("expected no X-Tenet-Session-Id header")
-	}
-}
-
-func TestFailoverOn5xx(t *testing.T) {
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(502)
-	}))
-	defer proxy.Close()
-
-	fallback := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"choices":[{"message":{"content":"fallback"}}]}`))
-	}))
-	defer fallback.Close()
-
-	client := WrapHTTPClient(http.DefaultClient, Config{
-		TenetKey: "tk_xxx",
-		ProxyURL: proxy.URL,
-		Failover: true,
-	})
-
-	req, _ := http.NewRequest("POST", fallback.URL+"/v1/chat/completions",
-		strings.NewReader(`{}`))
-	req.Header.Set("Authorization", "Bearer sk_xxx")
-	resp, err := client.Do(req)
+func TestOtherRequestsGoToTheProvider(t *testing.T) {
+	tenet, tenetGot := server(t, http.StatusOK, nil)
+	provider, providerGot := server(t, http.StatusOK, nil)
+	client := WrapHTTPClient(http.DefaultClient, Config{Key: testKey, Project: "support-agent", BaseURL: tenet.URL})
+	resp, err := client.Post(provider.URL+"/v1/embeddings", "application/json", strings.NewReader(`{"model":"text-embedding-3-small"}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	body, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(body), "fallback") {
-		t.Errorf("expected fallback response, got %s", string(body))
+	resp.Body.Close()
+	if len(*tenetGot) != 0 || len(*providerGot) != 1 {
+		t.Fatalf("tenet calls %d, provider calls %d; want 0 and 1", len(*tenetGot), len(*providerGot))
 	}
 }
 
-func TestNoFailoverOn4xx(t *testing.T) {
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(401)
-		w.Write([]byte(`{"error":"unauthorized"}`))
+func TestSessionSetters(t *testing.T) {
+	tenet, got := server(t, http.StatusOK, nil)
+	client := WrapHTTPClient(http.DefaultClient, Config{Key: testKey, Project: "support-agent", BaseURL: tenet.URL})
+	SetSessionID(client, "call-2")
+	SetSessionTags(client, []string{"a", "b"})
+	SetAgentID(client, "agent")
+	chat(t, client, "http://provider.invalid")
+	if r := (*got)[0]; r.sessionID != "call-2" || r.sessionTags != "a,b" || r.agentID != "agent" {
+		t.Fatalf("headers = %+v", r)
+	}
+}
+
+func TestInvalidConfigFailsRequests(t *testing.T) {
+	client := WrapHTTPClient(http.DefaultClient, Config{Key: "sk-provider", Project: "support-agent"})
+	req, _ := http.NewRequest(http.MethodPost, "http://provider.invalid/v1/chat/completions", strings.NewReader(`{}`))
+	if _, err := client.Do(req); err == nil {
+		t.Fatal("request with an invalid Config succeeded")
+	}
+}
+
+func TestGetPrompt(t *testing.T) {
+	var gotPath, gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotAuth = r.URL.Path, r.Header.Get("Authorization")
+		if strings.HasSuffix(r.URL.Path, ":missing") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		io.WriteString(w, `{"project":"support-agent","tag":"canary","version":4,"text":"Hello {{ name }}"}`)
 	}))
-	defer proxy.Close()
+	defer srv.Close()
+	config := Config{Key: testKey, Project: "support-agent", BaseURL: srv.URL}
+	client := WrapHTTPClient(http.DefaultClient, config)
 
-	client := WrapHTTPClient(http.DefaultClient, Config{
-		TenetKey: "tk_xxx",
-		ProxyURL: proxy.URL,
-		Failover: true,
-	})
-
-	req, _ := http.NewRequest("POST", "https://api.openai.com/v1/chat/completions",
-		strings.NewReader(`{}`))
-	req.Header.Set("Authorization", "Bearer sk_xxx")
-	resp, err := client.Do(req)
+	prompt, err := GetPrompt(context.Background(), client, config, "canary")
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	if resp.StatusCode != 401 {
-		t.Errorf("expected 401, got %d", resp.StatusCode)
+	if gotPath != "/v1/prompts/support-agent:canary" || gotAuth != "Bearer "+testKey {
+		t.Fatalf("request path %q auth %q", gotPath, gotAuth)
+	}
+	if prompt != (Prompt{Project: "support-agent", Tag: "canary", Version: 4, Text: "Hello {{ name }}"}) {
+		t.Fatalf("prompt = %+v", prompt)
+	}
+	if _, err := GetPrompt(context.Background(), nil, config, ""); err != nil || gotPath != "/v1/prompts/support-agent" {
+		t.Fatalf("production prompt: path %q err %v", gotPath, err)
+	}
+	if _, err := GetPrompt(context.Background(), nil, config, "missing"); !errors.Is(err, ErrPromptNotFound) {
+		t.Fatalf("missing tag err = %v, want ErrPromptNotFound", err)
 	}
 }
