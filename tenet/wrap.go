@@ -1,5 +1,5 @@
 // Package tenet sends an OpenAI-compatible client's chat completions to a
-// Tenet Project, and fetches the Project's prompts.
+// Tenet Agent, and fetches the Agent's prompts.
 //
 // Wrap the HTTP client of any [github.com/openai/openai-go] client. The client
 // keeps its own provider, key and model; those are the failover:
@@ -8,13 +8,13 @@
 //		option.WithAPIKey(os.Getenv("OPENAI_API_KEY")),
 //		option.WithHTTPClient(tenet.WrapHTTPClient(http.DefaultClient, tenet.Config{
 //			Key:      os.Getenv("TENET_API_KEY"),
-//			Project:  "support-agent",
+//			Agent:  "support-agent",
 //			Failover: true,
 //		})),
 //	)
 //
 // Every chat completion, streaming included, goes to Tenet as model
-// "<Project>[:<Tag>]". Tenet serves the version the tag names, and its own
+// "<Agent>[:<Tag>]". Tenet serves the version the tag names, and its own
 // fallback model when that version fails. With Failover set, a request Tenet
 // cannot answer (network error or 5xx) is sent unchanged to the provider.
 // Requests other than chat completions go to the provider directly.
@@ -28,6 +28,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -35,7 +36,7 @@ import (
 
 const defaultBaseURL = "https://inference.trytenet.ai"
 
-// name is what a Project ID or tag may hold in a model name; Tenet checks
+// name is what an Agent ID or tag may hold in a model name; Tenet checks
 // the rest.
 var name = regexp.MustCompile(`^[^\s:/]+$`)
 
@@ -44,10 +45,10 @@ type Config struct {
 	// Key is the Organization's Tenet key (sk-tnt-…).
 	Key string
 
-	// Project is the Tenet Project requests are sent to.
-	Project string
+	// Agent is the Tenet Agent requests are sent to.
+	Agent string
 
-	// Tag names the Project version to serve: production (the default),
+	// Tag names the Agent version to serve: production (the default),
 	// latest, a branch, a custom tag, or vN.
 	Tag string
 
@@ -75,10 +76,10 @@ type Config struct {
 
 // Attribution describes how a chat completion was served.
 type Attribution struct {
-	// Version is the version that served it as "<project>:v<N>", from
+	// Version is the version that served it as "<agent>:v<N>", from
 	// X-Tenet-Served-Version; empty when Tenet's fallback model did.
 	Version string
-	// FallbackUsed reports that Tenet served it with the Project's fallback.
+	// FallbackUsed reports that Tenet served it with the Agent's fallback.
 	FallbackUsed bool
 	// ServedDirect reports that the SDK failed over to the provider.
 	ServedDirect bool
@@ -94,9 +95,9 @@ func parseAttribution(h http.Header) Attribution {
 // Model is the model name a chat completion is sent to Tenet with.
 func (c Config) Model() string {
 	if c.Tag == "" {
-		return c.Project
+		return c.Agent
 	}
-	return c.Project + ":" + c.Tag
+	return c.Agent + ":" + c.Tag
 }
 
 func (c Config) baseURL() string {
@@ -111,8 +112,8 @@ func ValidateConfig(config Config) error {
 	if !strings.HasPrefix(strings.TrimSpace(config.Key), "sk-tnt-") {
 		return fmt.Errorf("tenet: Key must be a Tenet key (sk-tnt-…)")
 	}
-	if !name.MatchString(config.Project) {
-		return fmt.Errorf("tenet: Project is required and cannot contain spaces, ':' or '/'")
+	if !name.MatchString(config.Agent) {
+		return fmt.Errorf("tenet: Agent is required and cannot contain spaces, ':' or '/'")
 	}
 	if config.Tag != "" && !name.MatchString(config.Tag) {
 		return fmt.Errorf("tenet: Tag cannot contain spaces, ':' or '/'")
@@ -166,7 +167,7 @@ type transport struct {
 }
 
 // WrapHTTPClient returns a new [http.Client] that sends chat completions to
-// the Tenet Project. The wrapped client's transport makes the underlying
+// the Tenet Agent. The wrapped client's transport makes the underlying
 // calls, Tenet's and the provider's.
 func WrapHTTPClient(client *http.Client, config Config) *http.Client {
 	inner := client.Transport
@@ -219,7 +220,7 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, t.configErr
 	}
 	if req.Method != http.MethodPost || !strings.HasSuffix(req.URL.Path, "/chat/completions") {
-		return t.inner.RoundTrip(req)
+		return t.inner.RoundTrip(withoutTenetHeaders(req))
 	}
 
 	var original []byte
@@ -265,13 +266,16 @@ func (t *transport) tenetRequest(req *http.Request, body []byte) (*http.Request,
 		return nil, err
 	}
 	for key, values := range req.Header {
-		if strings.EqualFold(key, "Authorization") || strings.EqualFold(key, "Api-Key") {
+		if strings.EqualFold(key, "Authorization") || strings.EqualFold(key, "Api-Key") || strings.EqualFold(key, "X-Tenet-Prompt-Version") {
 			continue
 		}
 		out.Header[key] = values
 	}
 	out.Header.Set("Authorization", "Bearer "+strings.TrimSpace(t.config.Key))
 	out.Header.Set("Content-Type", "application/json")
+	if prompt, ok := req.Context().Value(promptContextKey{}).(Prompt); ok && prompt.Agent == t.config.Agent && prompt.Version > 0 {
+		out.Header.Set("X-Tenet-Prompt-Version", strconv.Itoa(prompt.Version))
+	}
 	if id, _ := t.agentID.Load().(string); id != "" {
 		out.Header.Set("X-Tenet-Agent-ID", id)
 	}
@@ -288,10 +292,21 @@ func (t *transport) tenetRequest(req *http.Request, body []byte) (*http.Request,
 func (t *transport) direct(req *http.Request, original []byte, reason string) (*http.Response, error) {
 	t.reportFailover(reason)
 	t.emit(Attribution{ServedDirect: true})
-	out := req.Clone(req.Context())
+	out := withoutTenetHeaders(req)
 	out.Body = io.NopCloser(bytes.NewReader(original))
 	out.ContentLength = int64(len(original))
 	return t.inner.RoundTrip(out)
+}
+
+// withoutTenetHeaders keeps Tenet metadata off requests sent to providers.
+func withoutTenetHeaders(req *http.Request) *http.Request {
+	out := req.Clone(req.Context())
+	for key := range out.Header {
+		if strings.HasPrefix(strings.ToLower(key), "x-tenet-") {
+			delete(out.Header, key)
+		}
+	}
+	return out
 }
 
 // withModel is a chat completion body with its model replaced; every other

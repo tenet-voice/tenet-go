@@ -61,14 +61,14 @@ func chat(t *testing.T, client *http.Client, providerURL string) *http.Response 
 }
 
 func TestValidateConfig(t *testing.T) {
-	valid := Config{Key: testKey, Project: "support-agent"}
+	valid := Config{Key: testKey, Agent: "support-agent"}
 	if err := ValidateConfig(valid); err != nil {
 		t.Fatalf("ValidateConfig(valid) = %v", err)
 	}
 	for name, mutate := range map[string]func(*Config){
 		"provider key":     func(c *Config) { c.Key = "sk-proj-123" },
-		"missing project":  func(c *Config) { c.Project = "" },
-		"project with tag": func(c *Config) { c.Project = "support:v2" },
+		"missing agent":    func(c *Config) { c.Agent = "" },
+		"agent with tag":   func(c *Config) { c.Agent = "support:v2" },
 		"tag with space":   func(c *Config) { c.Tag = "a b" },
 		"bad base URL":     func(c *Config) { c.BaseURL = "not-a-url" },
 		"negative timeout": func(c *Config) { c.Timeout = -time.Second },
@@ -85,12 +85,12 @@ func TestValidateConfig(t *testing.T) {
 	}
 }
 
-func TestChatCompletionGoesToTheProject(t *testing.T) {
+func TestChatCompletionGoesToTheAgent(t *testing.T) {
 	tenet, tenetGot := server(t, http.StatusOK, map[string]string{"X-Tenet-Served-Version": "v7"})
 	provider, providerGot := server(t, http.StatusOK, nil)
 	var attribution Attribution
 	client := WrapHTTPClient(http.DefaultClient, Config{
-		Key: testKey, Project: "support-agent", Tag: "canary", BaseURL: tenet.URL,
+		Key: testKey, Agent: "support-agent", Tag: "canary", BaseURL: tenet.URL,
 		SessionID: "call-1", SessionTags: []string{"beta"}, AgentID: "front-desk",
 		OnAttribution: func(a Attribution) { attribution = a },
 	})
@@ -114,9 +114,9 @@ func TestChatCompletionGoesToTheProject(t *testing.T) {
 	}
 }
 
-func TestBareProjectMeansProduction(t *testing.T) {
+func TestBareAgentMeansProduction(t *testing.T) {
 	tenet, got := server(t, http.StatusOK, nil)
-	client := WrapHTTPClient(http.DefaultClient, Config{Key: testKey, Project: "support-agent", BaseURL: tenet.URL})
+	client := WrapHTTPClient(http.DefaultClient, Config{Key: testKey, Agent: "support-agent", BaseURL: tenet.URL})
 	chat(t, client, "http://provider.invalid")
 	if model := (*got)[0].body["model"]; model != "support-agent" {
 		t.Fatalf("model = %v, want support-agent", model)
@@ -128,7 +128,7 @@ func TestFailoverSendsTheOriginalRequestToTheProvider(t *testing.T) {
 	provider, providerGot := server(t, http.StatusOK, nil)
 	var attribution Attribution
 	client := WrapHTTPClient(http.DefaultClient, Config{
-		Key: testKey, Project: "support-agent", BaseURL: tenet.URL, Failover: true,
+		Key: testKey, Agent: "support-agent", BaseURL: tenet.URL, Failover: true,
 		OnAttribution: func(a Attribution) { attribution = a },
 	})
 	chat(t, client, provider.URL)
@@ -145,7 +145,7 @@ func TestFailoverSendsTheOriginalRequestToTheProvider(t *testing.T) {
 func TestFailoverOnUnreachableTenet(t *testing.T) {
 	provider, providerGot := server(t, http.StatusOK, nil)
 	client := WrapHTTPClient(http.DefaultClient, Config{
-		Key: testKey, Project: "support-agent", BaseURL: "http://127.0.0.1:1", Failover: true,
+		Key: testKey, Agent: "support-agent", BaseURL: "http://127.0.0.1:1", Failover: true,
 	})
 	chat(t, client, provider.URL)
 	if len(*providerGot) != 1 {
@@ -156,7 +156,7 @@ func TestFailoverOnUnreachableTenet(t *testing.T) {
 func TestNoFailoverReturnsTenetsAnswer(t *testing.T) {
 	tenet, _ := server(t, http.StatusBadGateway, nil)
 	provider, providerGot := server(t, http.StatusOK, nil)
-	client := WrapHTTPClient(http.DefaultClient, Config{Key: testKey, Project: "support-agent", BaseURL: tenet.URL})
+	client := WrapHTTPClient(http.DefaultClient, Config{Key: testKey, Agent: "support-agent", BaseURL: tenet.URL})
 	if resp := chat(t, client, provider.URL); resp.StatusCode != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502", resp.StatusCode)
 	}
@@ -168,7 +168,7 @@ func TestNoFailoverReturnsTenetsAnswer(t *testing.T) {
 func TestClientErrorsAreNotFailedOver(t *testing.T) {
 	tenet, _ := server(t, http.StatusNotFound, nil)
 	provider, providerGot := server(t, http.StatusOK, nil)
-	client := WrapHTTPClient(http.DefaultClient, Config{Key: testKey, Project: "support-agent", BaseURL: tenet.URL, Failover: true})
+	client := WrapHTTPClient(http.DefaultClient, Config{Key: testKey, Agent: "support-agent", BaseURL: tenet.URL, Failover: true})
 	if resp := chat(t, client, provider.URL); resp.StatusCode != http.StatusNotFound || len(*providerGot) != 0 {
 		t.Fatalf("status = %d, provider calls = %d; want 404 from Tenet", resp.StatusCode, len(*providerGot))
 	}
@@ -177,7 +177,7 @@ func TestClientErrorsAreNotFailedOver(t *testing.T) {
 func TestOtherRequestsGoToTheProvider(t *testing.T) {
 	tenet, tenetGot := server(t, http.StatusOK, nil)
 	provider, providerGot := server(t, http.StatusOK, nil)
-	client := WrapHTTPClient(http.DefaultClient, Config{Key: testKey, Project: "support-agent", BaseURL: tenet.URL})
+	client := WrapHTTPClient(http.DefaultClient, Config{Key: testKey, Agent: "support-agent", BaseURL: tenet.URL})
 	resp, err := client.Post(provider.URL+"/v1/embeddings", "application/json", strings.NewReader(`{"model":"text-embedding-3-small"}`))
 	if err != nil {
 		t.Fatal(err)
@@ -190,7 +190,7 @@ func TestOtherRequestsGoToTheProvider(t *testing.T) {
 
 func TestSessionSetters(t *testing.T) {
 	tenet, got := server(t, http.StatusOK, nil)
-	client := WrapHTTPClient(http.DefaultClient, Config{Key: testKey, Project: "support-agent", BaseURL: tenet.URL})
+	client := WrapHTTPClient(http.DefaultClient, Config{Key: testKey, Agent: "support-agent", BaseURL: tenet.URL})
 	SetSessionID(client, "call-2")
 	SetSessionTags(client, []string{"a", "b"})
 	SetAgentID(client, "agent")
@@ -201,7 +201,7 @@ func TestSessionSetters(t *testing.T) {
 }
 
 func TestInvalidConfigFailsRequests(t *testing.T) {
-	client := WrapHTTPClient(http.DefaultClient, Config{Key: "sk-provider", Project: "support-agent"})
+	client := WrapHTTPClient(http.DefaultClient, Config{Key: "sk-provider", Agent: "support-agent"})
 	req, _ := http.NewRequest(http.MethodPost, "http://provider.invalid/v1/chat/completions", strings.NewReader(`{}`))
 	if _, err := client.Do(req); err == nil {
 		t.Fatal("request with an invalid Config succeeded")
@@ -216,10 +216,10 @@ func TestGetPrompt(t *testing.T) {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		io.WriteString(w, `{"project":"support-agent","tag":"canary","version":4,"text":"Hello {{ name }}"}`)
+		io.WriteString(w, `{"agent":"support-agent","tag":"canary","version":4,"text":"Hello {{ name }}"}`)
 	}))
 	defer srv.Close()
-	config := Config{Key: testKey, Project: "support-agent", BaseURL: srv.URL}
+	config := Config{Key: testKey, Agent: "support-agent", BaseURL: srv.URL}
 	client := WrapHTTPClient(http.DefaultClient, config)
 
 	prompt, err := GetPrompt(context.Background(), client, config, "canary")
@@ -229,7 +229,7 @@ func TestGetPrompt(t *testing.T) {
 	if gotPath != "/v1/prompts/support-agent:canary" || gotAuth != "Bearer "+testKey {
 		t.Fatalf("request path %q auth %q", gotPath, gotAuth)
 	}
-	if prompt != (Prompt{Project: "support-agent", Tag: "canary", Version: 4, Text: "Hello {{ name }}"}) {
+	if prompt != (Prompt{Agent: "support-agent", Tag: "canary", Version: 4, Text: "Hello {{ name }}"}) {
 		t.Fatalf("prompt = %+v", prompt)
 	}
 	if _, err := GetPrompt(context.Background(), nil, config, ""); err != nil || gotPath != "/v1/prompts/support-agent" {
@@ -237,5 +237,101 @@ func TestGetPrompt(t *testing.T) {
 	}
 	if _, err := GetPrompt(context.Background(), nil, config, "missing"); !errors.Is(err, ErrPromptNotFound) {
 		t.Fatalf("missing tag err = %v, want ErrPromptNotFound", err)
+	}
+}
+
+func TestPromptVersionHeader(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		prompt *Prompt
+		want   string
+	}{
+		{name: "no context"},
+		{name: "matching agent", prompt: &Prompt{Agent: "support-agent", Version: 12}, want: "12"},
+		{name: "other agent", prompt: &Prompt{Agent: "other-agent", Version: 12}},
+		{name: "zero version", prompt: &Prompt{Agent: "support-agent"}},
+		{name: "negative version", prompt: &Prompt{Agent: "support-agent", Version: -1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			headers := make(chan http.Header, 1)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				headers <- r.Header.Clone()
+				io.WriteString(w, `{"choices":[]}`)
+			}))
+			defer srv.Close()
+			client := WrapHTTPClient(http.DefaultClient, promptConfig(srv.URL))
+			ctx := context.Background()
+			if tc.prompt != nil {
+				ctx = WithPrompt(ctx, *tc.prompt)
+			}
+			req, _ := http.NewRequestWithContext(ctx, http.MethodPost,
+				"http://provider.invalid/v1/chat/completions", strings.NewReader(`{}`))
+			// Only the context may set attribution, even if a caller provides a header.
+			req.Header.Set("X-Tenet-Prompt-Version", "999")
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if got := (<-headers).Get("X-Tenet-Prompt-Version"); got != tc.want {
+				t.Fatalf("prompt header = %q, want %q", got, tc.want)
+			}
+			if got := req.Header.Get("X-Tenet-Prompt-Version"); got != "999" {
+				t.Fatal("original request headers were mutated")
+			}
+		})
+	}
+}
+
+func TestPromptVersionNeverSentToProvider(t *testing.T) {
+	for _, mode := range []string{"non-chat", "failover-5xx", "failover-network"} {
+		t.Run(mode, func(t *testing.T) {
+			tenetHeaders := make(chan http.Header, 2) // chat and failover telemetry
+			tenet := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				tenetHeaders <- r.Header.Clone()
+				w.WriteHeader(http.StatusBadGateway)
+			}))
+			defer tenet.Close()
+			providerHeaders := make(chan http.Header, 1)
+			provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				providerHeaders <- r.Header.Clone()
+				io.WriteString(w, `{"choices":[]}`)
+			}))
+			defer provider.Close()
+			config := promptConfig(tenet.URL)
+			config.Failover = true
+			if mode == "failover-network" {
+				tenet.Close()
+			}
+			client := WrapHTTPClient(http.DefaultClient, config)
+			path := "/v1/chat/completions"
+			if mode == "non-chat" {
+				path = "/v1/embeddings"
+			}
+			ctx := WithPrompt(context.Background(), Prompt{Agent: "support-agent", Version: 12})
+			req, _ := http.NewRequestWithContext(ctx, http.MethodPost, provider.URL+path, strings.NewReader(`{}`))
+			req.Header.Set("Authorization", "Bearer provider-key")
+			req.Header.Set("X-Tenet-Prompt-Version", "999")
+			req.Header.Set("X-Tenet-Session-Id", "session")
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			headers := <-providerHeaders
+			for key := range headers {
+				if strings.HasPrefix(strings.ToLower(key), "x-tenet-") {
+					t.Fatalf("provider received Tenet header %q", key)
+				}
+			}
+			if got := headers.Get("Authorization"); got != "Bearer provider-key" {
+				t.Fatalf("provider authorization = %q", got)
+			}
+			if mode == "failover-5xx" {
+				if got := (<-tenetHeaders).Get("X-Tenet-Prompt-Version"); got != "12" {
+					t.Fatalf("Tenet prompt header = %q, want 12", got)
+				}
+			}
+		})
 	}
 }

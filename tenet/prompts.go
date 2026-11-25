@@ -8,23 +8,24 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 )
 
-// ErrPromptNotFound means the Project has no prompt under the tag.
+// ErrPromptNotFound means the Agent has no prompt under the tag or version.
 var ErrPromptNotFound = errors.New("tenet: prompt not found")
 
-// Prompt is one version of a Project's prompt. Tenet stores the text as
+// Prompt is one version of an Agent's prompt. Tenet stores the text as
 // written (plain text, Jinja, or anything else) and never renders it.
 type Prompt struct {
-	Project string `json:"project"`
+	Agent   string `json:"agent"`
 	Tag     string `json:"tag"`
 	Version int    `json:"version"`
 	Text    string `json:"text"`
 }
 
-// GetPrompt fetches the prompt version a tag names in config.Project's prompt
-// store. An empty tag means production. Prompt tags are separate from version
+// GetPrompt fetches a tag or pinned version ("v<N>") from config.Agent's prompt
+// store. An empty tag means production. Prompt tags are separate from model
 // tags: config.Tag is not used.
 //
 // It makes one request; callers that need the prompt when Tenet cannot be
@@ -42,7 +43,7 @@ func GetPrompt(ctx context.Context, client *http.Client, config Config, tag stri
 	if t, ok := client.Transport.(*transport); ok {
 		client = &http.Client{Transport: t.inner, Timeout: client.Timeout}
 	}
-	ref := config.Project
+	ref := config.Agent
 	if tag != "" {
 		ref += ":" + tag
 	}
@@ -68,4 +69,21 @@ func GetPrompt(ctx context.Context, client *http.Client, config Config, tag stri
 		return Prompt{}, fmt.Errorf("tenet: decode prompt %s: %w", ref, err)
 	}
 	return prompt, nil
+}
+
+// GetPromptVersion fetches a specific prompt version. Version must be positive.
+func GetPromptVersion(ctx context.Context, client *http.Client, config Config, version int) (Prompt, error) {
+	if version <= 0 {
+		return Prompt{}, fmt.Errorf("tenet: prompt version must be positive")
+	}
+	return GetPrompt(ctx, client, config, "v"+strconv.Itoa(version))
+}
+
+type promptContextKey struct{}
+
+// WithPrompt records the prompt used by a request. WrapHTTPClient sends its
+// version to Tenet when prompt.Agent matches Config.Agent and Version is positive.
+// It does not change the request's messages or the model version being served.
+func WithPrompt(ctx context.Context, prompt Prompt) context.Context {
+	return context.WithValue(ctx, promptContextKey{}, prompt)
 }
