@@ -1,13 +1,13 @@
 # Tenet Go SDK
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/tenet-voice/tenet-go/v2.svg)](https://pkg.go.dev/github.com/tenet-voice/tenet-go/v2)
+[![Go Reference](https://pkg.go.dev/badge/github.com/tenet-voice/tenet-go.svg)](https://pkg.go.dev/github.com/tenet-voice/tenet-go)
 
 Send your agent's chat completions to a [Tenet](https://trytenet.ai) Agent, keep your own provider as the failover, and fetch the Agent's prompts.
 
 ## Install
 
 ```bash
-go get github.com/tenet-voice/tenet-go/v2
+go get github.com/tenet-voice/tenet-go@v0.3.0
 ```
 
 ## Quick start
@@ -21,7 +21,7 @@ import (
 
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
-	"github.com/tenet-voice/tenet-go/v2/tenet"
+	"github.com/tenet-voice/tenet-go/tenet"
 )
 
 httpClient := tenet.WrapHTTPClient(http.DefaultClient, tenet.Config{
@@ -143,9 +143,9 @@ For streaming it fires when the response headers arrive. It runs inside the requ
 
 Tenet speaks the OpenAI Chat Completions API. Any OpenAI-compatible client works with base URL `https://inference.trytenet.ai/v1`, your `sk-tnt-…` key as the API key, and model `<agent>[:<tag>]`. The SDK adds client-side failover, prompts and attribution.
 
-## Upgrading from v1
+## Upgrading from v0.2
 
-- Module path is `github.com/tenet-voice/tenet-go/v2`.
+- v0.3.0 keeps the module path `github.com/tenet-voice/tenet-go`. Project is now Agent; fetch prompts with `GetPrompt` or cache them with `NewPrompts`.
 - `TenetKey` is `Key` and must be a `sk-tnt-…` key; `ProxyURL` is `BaseURL`.
 - Add `Agent` (and `Tag` if not `production`). The model your client sends is kept only for failover.
 - `Attribution` has `Version`, `FallbackUsed`, `ServedDirect`; `Mode`, `ServedVariant` and `MatchedProfile` are gone.

@@ -9,7 +9,7 @@ import (
 
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
-	"github.com/tenet-voice/tenet-go/v2/tenet"
+	"github.com/tenet-voice/tenet-go/tenet"
 )
 
 func main() {

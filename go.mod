@@ -1,4 +1,4 @@
-module github.com/tenet-voice/tenet-go/v2
+module github.com/tenet-voice/tenet-go
 
 go 1.23.0
 
